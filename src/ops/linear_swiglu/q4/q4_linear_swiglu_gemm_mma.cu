@@ -7,6 +7,7 @@
 #include "ops/common/token_slices.h"
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -16,7 +17,8 @@ using GateUpC48Cfg  = GemmCfg<64, 48, 64, 64, 8, 2, 1, false, true, true>;
 using GateUpC128Cfg = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
 
 template <class Cfg, bool Full>
-void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_folded(const Tensor& x, const Weight& weight, std::int32_t row_begin, Tensor& out,
+                   cudaStream_t stream) {
     constexpr int PM = Cfg::BM / 2;
     const int t      = x.ne[1];
     const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], PM)),
@@ -26,27 +28,28 @@ void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStrea
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
-            out.ne[0], x.ne[0], t, weight.padded_shape[1]);
+            out.ne[0], weight.n / 2, row_begin, x.ne[0], t, weight.padded_shape[1]);
     } else {
         q4_linear_swiglu_mma_split_half_pair_kernel<Cfg, false><<<grid, Cfg::THREADS, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
-            out.ne[0], x.ne[0], t, weight.padded_shape[1]);
+            out.ne[0], weight.n / 2, row_begin, x.ne[0], t, weight.padded_shape[1]);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Cfg>
-void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_route(const Tensor& x, const Weight& weight, std::int32_t row_begin, Tensor& out,
+                  cudaStream_t stream) {
     const bool full = (x.ne[1] % Cfg::BN) == 0;
     for_each_token_slice(x.ne[1], Cfg::BN, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);
         Tensor out_slice     = out.slice(1, offset, count);
         if (full) {
-            launch_folded<Cfg, true>(x_slice, weight, out_slice, stream);
+            launch_folded<Cfg, true>(x_slice, weight, row_begin, out_slice, stream);
         } else {
-            launch_folded<Cfg, false>(x_slice, weight, out_slice, stream);
+            launch_folded<Cfg, false>(x_slice, weight, row_begin, out_slice, stream);
         }
     });
 }
@@ -55,17 +58,39 @@ void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 
 void q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(const Tensor& x, const Weight& weight,
                                                           Tensor& out, cudaStream_t stream) {
-    launch_route<GateUpC128Cfg>(x, weight, out, stream);
+    launch_route<GateUpC128Cfg>(x, weight, 0, out, stream);
 }
 
 void q4_linear_swiglu_mma_split_half_pair_r32_c40_launch(const Tensor& x, const Weight& weight,
                                                          Tensor& out, cudaStream_t stream) {
-    launch_route<GateUpC40Cfg>(x, weight, out, stream);
+    launch_route<GateUpC40Cfg>(x, weight, 0, out, stream);
 }
 
 void q4_linear_swiglu_mma_split_half_pair_r32_c48_launch(const Tensor& x, const Weight& weight,
                                                          Tensor& out, cudaStream_t stream) {
-    launch_route<GateUpC48Cfg>(x, weight, out, stream);
+    launch_route<GateUpC48Cfg>(x, weight, 0, out, stream);
+}
+
+void q4_linear_swiglu_mma_shard_launch(const Tensor& x, const Weight& weight,
+                                       std::int32_t row_begin, Tensor& out,
+                                       cudaStream_t stream) {
+    constexpr std::int32_t kIntermediate = 17408;
+    const bool full_parent =
+        weight.n == 2 * kIntermediate && row_begin + out.ne[0] <= kIntermediate;
+    const bool compact = weight.n == 2 * out.ne[0] && row_begin == 0;
+    if ((!full_parent && !compact) || weight.k != 5120 || x.ne[0] != 5120 || x.ne[1] <= 1 ||
+        out.ne[1] != x.ne[1] || row_begin < 0 || out.ne[0] <= 0 ||
+        (row_begin % 32) != 0 ||
+        (out.ne[0] % 32) != 0) {
+        throw std::invalid_argument("q4 graph-shard SwiGLU MMA has invalid geometry");
+    }
+    if (x.ne[1] <= 40) {
+        launch_route<GateUpC40Cfg>(x, weight, row_begin, out, stream);
+    } else if (x.ne[1] <= 48) {
+        launch_route<GateUpC48Cfg>(x, weight, row_begin, out, stream);
+    } else {
+        launch_route<GateUpC128Cfg>(x, weight, row_begin, out, stream);
+    }
 }
 
 } // namespace ninfer::ops::detail

@@ -33,6 +33,7 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
+    static constexpr bool supports_graph_parallel              = false;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
@@ -86,6 +87,11 @@ struct Variant {
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);
+    static void post_mixer_graph(const Tensor& hidden, const PostMixerWeights& weights,
+                                 Tensor& residual, WorkspaceArena& primary_workspace,
+                                 WorkspaceArena& secondary_workspace,
+                                 const DeviceArena& primary_weights,
+                                 const DeviceArena& secondary_weights, DeviceContext& device);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 

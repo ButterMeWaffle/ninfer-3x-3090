@@ -44,41 +44,48 @@ struct Q4SwiGluSmallTGeometry {
 struct Q4SwiGluSmallTRows {
     static constexpr int kOutputRowsPerCta = 8;
 
+    int row_begin   = 0;
+    int intermediate = kIntermediate;
+
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
-        return output_row0 + (local_row & 7) + (local_row >= 8 ? kIntermediate : 0);
+        return row_begin + output_row0 + (local_row & 7) +
+               (local_row >= 8 ? intermediate : 0);
     }
 };
 
 struct Q4SwiGluSmallTEpilogue {
     __nv_bfloat16* out;
+    int rows;
 
     template <int ActiveCols>
     __device__ __forceinline__ void store(int row, int col0, float4 projected) const {
         if (col0 < ActiveCols) {
-            out[static_cast<std::int64_t>(col0) * kIntermediate + row] =
+            out[static_cast<std::int64_t>(col0) * rows + row] =
                 __float2bfloat16_rn(silu(projected.x) * projected.z);
         }
         if (col0 + 1 < ActiveCols) {
-            out[static_cast<std::int64_t>(col0 + 1) * kIntermediate + row] =
+            out[static_cast<std::int64_t>(col0 + 1) * rows + row] =
                 __float2bfloat16_rn(silu(projected.y) * projected.w);
         }
     }
 };
 
-using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using SmallTLauncher =
+    void (*)(const Tensor&, const Weight&, std::int32_t, Tensor&, cudaStream_t);
 
 template <int ActiveCols>
-void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+void launch_small_t_active(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
+                           cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerCta;
-    const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data)};
+    const int blocks = out.ne[0] / Q4SwiGluSmallTRows::kOutputRowsPerCta;
+    const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), out.ne[0]};
     q4_small_t_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
                           Q4SwiGluSmallTRows>
-        <<<kBlocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
+        <<<blocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-            epilogue, Q4SwiGluSmallTRows{});
+            epilogue, Q4SwiGluSmallTRows{row_begin, w.n / 2});
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -114,7 +121,8 @@ __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[
 __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
                                                   const std::uint8_t* __restrict__ codes,
                                                   const std::uint8_t* __restrict__ scales,
-                                                  __nv_bfloat16* __restrict__ out) {
+                                                  __nv_bfloat16* __restrict__ out,
+                                                  int row_begin, int weight_intermediate) {
     constexpr int kStages   = 3;
     constexpr int kPrefetch = kStages - 1;
     __shared__ __align__(16) __nv_bfloat16 x_sh[kK];
@@ -130,15 +138,16 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 
     const int lane    = static_cast<int>(threadIdx.x) & 31;
     const int warp    = static_cast<int>(threadIdx.x) >> 5;
-    const int out_row = static_cast<int>(blockIdx.x) * kPairsPerBlock + warp;
+    const int local_out_row = static_cast<int>(blockIdx.x) * kPairsPerBlock + warp;
+    const int out_row       = row_begin + local_out_row;
 
     const std::uint8_t* gate_code_row =
         codes + static_cast<std::int64_t>(out_row) * kGroups * kBytesPerGroup;
     const std::uint8_t* gate_scale_row = scales + static_cast<std::int64_t>(out_row) * kGroups * 2;
     const std::uint8_t* up_code_row =
-        codes + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * kBytesPerGroup;
+        codes + static_cast<std::int64_t>(out_row + weight_intermediate) * kGroups * kBytesPerGroup;
     const std::uint8_t* up_scale_row =
-        scales + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * 2;
+        scales + static_cast<std::int64_t>(out_row + weight_intermediate) * kGroups * 2;
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x_sh);
 
     float gate_acc = 0.0f;
@@ -197,7 +206,7 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 
     gate_acc = warp_reduce_sum(gate_acc);
     up_acc   = warp_reduce_sum(up_acc);
-    if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
+    if (lane == 0) { out[local_out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
 } // namespace
@@ -210,7 +219,27 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
     const int grid = kIntermediate / kPairsPerBlock;
     q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), 0,
+        kIntermediate);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void q4_linear_swiglu_gemv_pair_shard_launch(const Tensor& x, const Weight& w,
+                                             std::int32_t row_begin, Tensor& out,
+                                             cudaStream_t stream) {
+    const bool full_parent = w.n == kN && row_begin + out.ne[0] <= kIntermediate;
+    const bool compact     = w.n == 2 * out.ne[0] && row_begin == 0;
+    if ((!full_parent && !compact) || w.k != kK || w.padded_shape[1] != kK ||
+        x.ne[0] != kK || x.ne[1] != 1 || out.ne[1] != 1 || row_begin < 0 ||
+        out.ne[0] <= 0 || (row_begin % kPairsPerBlock) != 0 ||
+        (out.ne[0] % kPairsPerBlock) != 0) {
+        throw std::invalid_argument("q4 linear_swiglu GEMV shard has invalid geometry");
+    }
+    const int grid = out.ne[0] / kPairsPerBlock;
+    q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+        row_begin, w.n / 2);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -219,7 +248,22 @@ void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Ten
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }
-    kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, w, out, stream);
+    kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, w, 0, out, stream);
+}
+
+void q4_linear_swiglu_small_t_shard_launch(const Tensor& x, const Weight& w,
+                                           std::int32_t row_begin, Tensor& out,
+                                           cudaStream_t stream) {
+    const bool full_parent = w.n == kN && row_begin + out.ne[0] <= kIntermediate;
+    const bool compact     = w.n == 2 * out.ne[0] && row_begin == 0;
+    if ((!full_parent && !compact) || w.k != kK || w.padded_shape[1] != kK ||
+        x.ne[0] != kK || x.ne[1] < 2 || x.ne[1] > 32 || out.ne[1] != x.ne[1] ||
+        row_begin < 0 || out.ne[0] <= 0 ||
+        (row_begin % Q4SwiGluSmallTRows::kOutputRowsPerCta) != 0 ||
+        (out.ne[0] % Q4SwiGluSmallTRows::kOutputRowsPerCta) != 0) {
+        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T shard has invalid geometry");
+    }
+    kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, w, row_begin, out, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -56,7 +56,7 @@ __device__ __forceinline__ float q5_gemv_consume_tile(const __nv_bfloat162* __re
                                                       const uint4* __restrict__ s_nib,
                                                       const uint4* __restrict__ s_hi,
                                                       const uint4* __restrict__ s_sc, int tile,
-                                                      int lane, float acc) {
+                                                      int group_origin, int lane, float acc) {
     constexpr int kGroupK              = 64;
     constexpr int kGroupsPerTile       = 16;
     constexpr int kNibbleBytesPerGroup = 32;
@@ -73,7 +73,7 @@ __device__ __forceinline__ float q5_gemv_consume_tile(const __nv_bfloat162* __re
         const int q0 = sign_extend<5>(static_cast<int>((low & 0x0fu) | ((high & 0x01u) << 4)));
         const int q1 = sign_extend<5>(static_cast<int>((low >> 4) | ((high & 0x02u) << 3)));
 
-        const int k0    = (g0 + tg) * kGroupK + lane * 2;
+        const int k0    = (g0 + tg - group_origin) * kGroupK + lane * 2;
         const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
         acc             = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
         acc             = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
@@ -108,7 +108,8 @@ __global__ void
 q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                         const std::uint8_t* __restrict__ high_bits,
                         const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
-                        __nv_bfloat16* __restrict__ out_tail, Epilogue epilogue = {}) {
+                        __nv_bfloat16* __restrict__ out_tail, Epilogue epilogue = {},
+                        int tile_begin = 0, int tile_count = -1) {
     constexpr int kGroupK              = 64;
     constexpr int kGroups              = kK / kGroupK;
     constexpr int kGroupsPerTile       = 16;
@@ -117,6 +118,8 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
     constexpr int kHighBytesPerGroup   = 8;
     constexpr int kXVecs               = kK / 8; // x as uint4 (8 bf16 each)
     constexpr int kPrefetch            = kStages - 1;
+    const int active_tiles             = tile_count < 0 ? kTiles : tile_count;
+    const int group_origin             = tile_begin * kGroupsPerTile;
     static_assert(kGroups % kGroupsPerTile == 0, "K must be a multiple of 16 groups (1024)");
     static_assert(kN % kRowsPerBlock == 0, "N must be a multiple of kRowsPerBlock");
     static_assert(kStages >= 2, "need at least double buffering");
@@ -161,9 +164,9 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
     // constant pipe_wait<kPrefetch>() in the loop is always valid.
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
-        if (p < kTiles) {
+        if (p < active_tiles) {
             q5_gemv_issue_tile(s_nib[warp][p], s_hi[warp][p], s_sc[warp][p], code_row, high_row,
-                               scale_row, p, lane);
+                               scale_row, tile_begin + p, lane);
         } else {
             pipe_commit();
         }
@@ -171,12 +174,12 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
 
     float acc = 0.0f;
 #pragma unroll 1
-    for (int tile = 0; tile < kTiles; ++tile) {
+    for (int tile = 0; tile < active_tiles; ++tile) {
         const int fetch = tile + kPrefetch;
-        if (fetch < kTiles) {
+        if (fetch < active_tiles) {
             const int buf = fetch % kStages;
             q5_gemv_issue_tile(s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf], code_row,
-                               high_row, scale_row, fetch, lane);
+                               high_row, scale_row, tile_begin + fetch, lane);
         } else {
             pipe_commit();
         }
@@ -184,8 +187,8 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
         __syncwarp();
 
         const int buf = tile % kStages;
-        acc = q5_gemv_consume_tile(x2, s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf], tile,
-                                   lane, acc);
+        acc = q5_gemv_consume_tile(x2, s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf],
+                                   tile_begin + tile, group_origin, lane, acc);
         __syncwarp();
     }
 

@@ -120,6 +120,18 @@ int test_cli_contract() {
                        "help names native artifact");
     failures += expect(parse_for_test({"ninfer_bench", "--help"}).help_requested, "help flag");
 
+    const auto graph = parse_for_test(
+        {"ninfer_bench", "--weights", "model.ninfer", "--devices", "1,2"});
+    failures += expect(graph.devices == std::vector<int>({1, 2}) && graph.device == 1 &&
+                           !graph.use_cuda_graph,
+                       "graph device settings");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--device", "1",
+                                  "--devices", "1,2"});
+        },
+        "mixed device flags");
+
     failures += expect_throws<std::invalid_argument>([] { (void)parse_for_test({"ninfer_bench"}); },
                                                      "missing artifact");
     failures += expect_throws<std::invalid_argument>(
@@ -230,6 +242,7 @@ qb::BenchEnvironment sample_environment() {
                                              .upload_seconds       = 2.0,
                                              .artifact_bytes_read  = 17500000000ULL,
                                              .host_to_device_bytes = 17400000000ULL,
+                                             .peer_to_peer_bytes   = 17300000000ULL,
                                              .peak_staging_bytes   = 134217728ULL,
                                              .tensor_count         = 1118,
                                              .resource_count       = 6};
@@ -238,8 +251,10 @@ qb::BenchEnvironment sample_environment() {
     env.memory.kv_capacity                = 8192;
     env.memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
     env.memory.weights                    = {17400000000ULL, 17400000000ULL, 17400000000ULL};
+    env.memory.secondary_weights          = {5000000000ULL, 5000000000ULL, 5000000000ULL};
     env.memory.sequence                   = {2000000000ULL, 1900000000ULL, 1900000000ULL};
     env.memory.workspace                  = {100000000ULL, 0, 0};
+    env.memory.secondary_workspace        = {100000000ULL, 0, 0};
     env.memory.request_transient          = {50000000ULL, 0, 40000000ULL};
     env.memory.cuda_graph_allowance_bytes = 150000000ULL;
     env.memory.kv_payload_bytes           = 123456ULL;
@@ -277,10 +292,16 @@ int test_report_contract() {
     failures += expect(report.at("load").at("weights_id") == "groupwise-int", "load weights id");
     failures +=
         expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
+    failures += expect(report.at("load").at("peer_to_peer_bytes") == 17300000000ULL,
+                       "load peer-to-peer bytes");
     failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
     failures += expect(report.at("memory").at("kv_capacity") == 8192, "memory KV capacity");
     failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
                        "workspace capacity");
+    failures += expect(
+        report.at("memory").at("secondary_weights").at("capacity_bytes") == 5000000000ULL &&
+            report.at("memory").at("secondary_workspace").at("capacity_bytes") == 100000000ULL,
+        "secondary device memory");
     failures +=
         expect(report.at("memory").at("request_transient").at("capacity_bytes") == 50000000ULL,
                "request transient capacity");

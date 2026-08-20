@@ -3,8 +3,10 @@
 #include <cuda_runtime.h>
 
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -44,6 +46,27 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
         ++failures;
     }
     return failures;
+}
+
+std::vector<int> find_peer_pair(int count) {
+    for (int first = 0; first < count; ++first) {
+        cudaDeviceProp first_properties{};
+        CUDA_CHECK(cudaGetDeviceProperties(&first_properties, first));
+        for (int second = first + 1; second < count; ++second) {
+            cudaDeviceProp second_properties{};
+            CUDA_CHECK(cudaGetDeviceProperties(&second_properties, second));
+            int first_to_second = 0;
+            int second_to_first = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&first_to_second, first, second));
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&second_to_first, second, first));
+            if (first_to_second != 0 && second_to_first != 0 &&
+                first_properties.major == second_properties.major &&
+                first_properties.minor == second_properties.minor) {
+                return {first, second};
+            }
+        }
+    }
+    return {};
 }
 
 } // namespace
@@ -95,6 +118,36 @@ int main() {
     if (elapsed_ms < 0.0f) {
         ++failures;
         std::cerr << "timer elapsed time was negative\n";
+    }
+
+    const std::vector<int> peer_pair = find_peer_pair(count);
+    if (!peer_pair.empty()) {
+        ninfer::DeviceContext dual{std::span<const int>(peer_pair)};
+        if (!dual.model_parallel() || dual.size() != 2 || dual.device_ids() != peer_pair ||
+            dual.active_rank() != 0 || dual.fence_for_rank(0) == nullptr ||
+            dual.fence_for_rank(1) == nullptr) {
+            ++failures;
+            std::cerr << "two-device context topology is invalid\n";
+        }
+        dual.activate_rank(1);
+        int active_device = -1;
+        CUDA_CHECK(cudaGetDevice(&active_device));
+        if (active_device != peer_pair[1] || dual.device != peer_pair[1]) {
+            ++failures;
+            std::cerr << "rank activation did not select the secondary device\n";
+        }
+        dual.activate_rank(0);
+        dual.synchronize();
+
+        bool duplicate_rejected = false;
+        try {
+            const std::vector<int> duplicate = {peer_pair[0], peer_pair[0]};
+            ninfer::DeviceContext invalid{std::span<const int>(duplicate)};
+        } catch (const std::invalid_argument&) { duplicate_rejected = true; }
+        if (!duplicate_rejected) {
+            ++failures;
+            std::cerr << "duplicate device ids were accepted\n";
+        }
     }
 
     return failures == 0 ? 0 : fail("device test failed");

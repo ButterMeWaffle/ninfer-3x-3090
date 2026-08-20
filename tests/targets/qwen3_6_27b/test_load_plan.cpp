@@ -5,6 +5,7 @@
 
 #include <ninfer/targets/qwen3_6_27b/package.h>
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -80,6 +81,30 @@ int verify_groupwise(const std::filesystem::path& path) {
             std::cerr << "groupwise MLP storage profile changed\n";
             return 1;
         }
+    }
+
+    ninfer::artifact::Binder graph_binder(reader);
+    const ArtifactLoadPlan graph_plan =
+        bind_artifact(graph_binder, WeightsProfile::GroupwiseInt, all_features(), true);
+    const auto& materialization = graph_plan.materialization;
+    const std::size_t paired_rows = static_cast<std::size_t>(std::count_if(
+        materialization.row_split_shards.begin(), materialization.row_split_shards.end(),
+        [](const ninfer::artifact::RowSplitShardMaterialization& shard) {
+            return shard.axis == ninfer::artifact::RowSplitShardAxis::PairedRows &&
+                   shard.split == 8192;
+        }));
+    const std::size_t columns = static_cast<std::size_t>(std::count_if(
+        materialization.row_split_shards.begin(), materialization.row_split_shards.end(),
+        [](const ninfer::artifact::RowSplitShardMaterialization& shard) {
+            return shard.axis == ninfer::artifact::RowSplitShardAxis::Columns &&
+                   shard.split == 8192;
+        }));
+    if (materialization.row_split_shards.size() != 128 || paired_rows != 64 || columns != 64 ||
+        materialization.source_device_capacity_bytes <=
+            materialization.device_capacity_bytes ||
+        materialization.secondary_device_capacity_bytes == 0) {
+        std::cerr << "groupwise graph materialization plan has the wrong weight ownership\n";
+        return 1;
     }
     return 0;
 }

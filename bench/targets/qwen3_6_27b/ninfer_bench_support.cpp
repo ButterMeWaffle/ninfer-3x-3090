@@ -68,6 +68,16 @@ std::vector<int> parse_int_list(std::string_view value, const char* label) {
     return out;
 }
 
+std::vector<int> parse_devices(std::string_view value) {
+    const std::size_t comma = value.find(',');
+    if (comma == std::string_view::npos || comma == 0 || comma + 1 >= value.size() ||
+        value.find(',', comma + 1) != std::string_view::npos) {
+        throw std::invalid_argument("--devices expects exactly two CUDA device ordinals");
+    }
+    return {parse_nonnegative(value.substr(0, comma), "devices"),
+            parse_nonnegative(value.substr(comma + 1), "devices")};
+}
+
 std::vector<std::pair<int, int>> parse_pair_list(std::string_view value, const char* label) {
     std::vector<std::pair<int, int>> out;
     std::size_t start = 0;
@@ -274,6 +284,7 @@ std::string usage_text(std::string_view program) {
         << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
+        << "  --devices <primary,secondary>  dense-27B graph-parallel CUDA devices\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
@@ -287,6 +298,8 @@ std::string usage_text(std::string_view program) {
 BenchOptions parse_args(int argc, char** argv) {
     BenchOptions options;
     bool saw_artifact = false;
+    bool saw_device   = false;
+    bool saw_devices  = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         auto value = [&](const char* flag) -> std::string {
@@ -333,6 +346,10 @@ BenchOptions parse_args(int argc, char** argv) {
             options.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--device") {
             options.device = parse_nonnegative(value("--device"), "device");
+            saw_device     = true;
+        } else if (arg == "--devices") {
+            options.devices = parse_devices(value("--devices"));
+            saw_devices     = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--profile-measured") {
@@ -355,6 +372,13 @@ BenchOptions parse_args(int argc, char** argv) {
         }
     }
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
+    if (saw_device && saw_devices) {
+        throw std::invalid_argument("--device and --devices are mutually exclusive");
+    }
+    if (saw_devices) {
+        options.device         = options.devices.front();
+        options.use_cuda_graph = false;
+    }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
@@ -555,7 +579,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " bytes)\n"
         << "  load:       " << env.load.load_seconds << " s, upload " << env.load.upload_seconds
         << " s, read " << format_bytes(env.load.artifact_bytes_read) << ", H2D "
-        << format_bytes(env.load.host_to_device_bytes) << ", staging peak "
+        << format_bytes(env.load.host_to_device_bytes) << ", peer copies "
+        << format_bytes(env.load.peer_to_peer_bytes) << ", staging peak "
         << format_bytes(env.load.peak_staging_bytes) << '\n'
         << "  memory:     weights " << format_bytes(env.memory.weights.capacity_bytes)
         << ", sequence " << format_bytes(env.memory.sequence.capacity_bytes) << ", workspace "
@@ -634,6 +659,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"upload_seconds\": " << number(env.load.upload_seconds) << ",\n"
         << "    \"artifact_bytes_read\": " << env.load.artifact_bytes_read << ",\n"
         << "    \"host_to_device_bytes\": " << env.load.host_to_device_bytes << ",\n"
+        << "    \"peer_to_peer_bytes\": " << env.load.peer_to_peer_bytes << ",\n"
         << "    \"peak_staging_bytes\": " << env.load.peak_staging_bytes << ",\n"
         << "    \"tensor_count\": " << env.load.tensor_count << ",\n"
         << "    \"resource_count\": " << env.load.resource_count << "\n"
@@ -650,8 +676,10 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.memory.kv_cache) << "\",\n";
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
+    append_arena_json(out, "secondary_weights", env.memory.secondary_weights, "    ", true);
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
+    append_arena_json(out, "secondary_workspace", env.memory.secondary_workspace, "    ", true);
     append_arena_json(out, "request_transient", env.memory.request_transient, "    ", true);
     out << "    \"minimum_runtime_reservation_bytes\": "
         << env.memory.minimum_runtime_reservation_bytes << ",\n"

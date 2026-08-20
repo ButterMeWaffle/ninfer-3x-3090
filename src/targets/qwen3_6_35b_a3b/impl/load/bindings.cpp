@@ -233,6 +233,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
+    runtime.secondary_weights_arena =
+        backing.device_arena_count() > 1 ? &backing.device_arena(1) : nullptr;
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;

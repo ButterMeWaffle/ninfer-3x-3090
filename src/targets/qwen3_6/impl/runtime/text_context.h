@@ -157,7 +157,8 @@ public:
                 std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
+                WorkspaceArena* secondary_work             = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -285,6 +286,7 @@ private:
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
+    WorkspaceArena* secondary_work_ = nullptr;
     qwen3_6::PagedKVCacheView kv_;
     qwen3_6::PagedKVCacheView mtp_kv_;
     const qwen3_6::PagedKVCache* batch_text_kv_ = nullptr;

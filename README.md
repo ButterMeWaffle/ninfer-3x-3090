@@ -1,10 +1,11 @@
 # NInfer-3090
 
 NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on one
-24 GB NVIDIA GeForce RTX 3090. Qwen3.8-27B is a first-class, tested target: the native SM86
-runtime loads its official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible
-APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP speculative decoding,
-reasoning-effort control, ReplaySSM state transactions, and concurrent cohorts through **C8**.
+24 GB NVIDIA GeForce RTX 3090, with an optional dual-3090 NVLink graph-parallel route. Qwen3.8-27B
+is a first-class, tested target: the native SM86 runtime loads its official groupwise `.ninfer`
+artifact, serves OpenAI- and Anthropic-compatible APIs, and supports paged KV, compatible-prefix
+reuse, CUDA Graphs, MTP speculative decoding, reasoning-effort control, ReplaySSM state
+transactions, and concurrent cohorts through **C8**.
 
 Community project, maintained on a best-effort basis. Issues and PRs are very welcome, but support
 and feature requests are not guaranteed.
@@ -21,6 +22,30 @@ This fork targets `sm_86`. Blackwell-only NVFP4/W4A4 execution is unavailable.
 The goal is the make the utmost rippin Qwen inference stack for the 3000 series. Gladly taking PR's, all help much appreciated. 
 
 Release notes for this branch: [v0.6.1](RELEASE_NOTES_0.6.1.md).
+
+## Dual RTX 3090 graph parallelism
+
+The dense 27B groupwise targets can split every text-layer MLP across two peer-connected SM86
+devices. Both GPUs run their gate/up and down-projection shards concurrently; the secondary partial
+is reduced into the primary residual over NVLink. Prompt prefill, ordinary decode, and MTP
+verification all use the split.
+
+```bash
+./build-sm86/apps/ninfer models/qwen3_8_27b.ninfer \
+  --prompt "Explain NVLink graph parallelism." \
+  --max-context 8192 --max-new 256 --kv-dtype int8 \
+  --devices 1,2
+```
+
+The two listed CUDA devices must have the same compute capability and bidirectional peer access.
+CUDA device order can differ from `nvidia-smi` order, especially when an Ada display card is also
+installed; use the probe in the [Linux guide](docs/rtx-3090-linux.md#dual-3090-nvlink) and select
+the two CUDA indices whose PCI bus IDs identify the 3090s. The route physically shards the packed
+main-model Q4/Q5 MLP weights 8,192/9,216; attention, KV state, and unsplit weights stay on the
+primary. CUDA Graph capture is disabled for this cross-device schedule and an eager representative
+round is warmed at startup instead. The 35B-A3B and 27B NVFP4 targets currently reject `--devices`.
+See [GRAPH-MODE-README.md](GRAPH-MODE-README.md) for compile steps, startup memory peaks, and C2-C8
+serving guidance.
 
 ## Choose a platform
 
@@ -282,12 +307,14 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 
 ## Current limits
 
-- One process owns one model on one RTX 3090.
+- One process owns one model on one RTX 3090, or one dense-27B graph split across an ordered pair
+  of peer-connected SM86 GPUs.
 - Concurrency is fixed at startup and limited to 1-8 by the API; compact 35B fits C1-C6 and
   Qwen3.8-27B fits C8/8K with MTP3 through ReplaySSM.
 - The shared KV pool is fixed at startup and is not divided statically among request lanes.
 - This is bounded small-scale batching, not preemptive large-scale continuous batching.
-- No multi-GPU execution or CPU/GPU weight offload.
+- Multi-GPU execution is limited to the dense 27B groupwise Q4/Q5 MLP graph; there is no CPU/GPU
+  weight offload, 35B graph split, or NVFP4 graph split.
 - Tool calls are returned to the client but are not executed by NInfer.
 - NVFP4 A4 and TMA kernels require Blackwell and are unavailable on SM86.
 - The paged runtime exposes BF16, INT8, and experimental opt-in `rk8v4` KV. INT8 remains the

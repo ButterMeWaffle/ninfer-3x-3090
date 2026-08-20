@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/.." && pwd)"
+server="${NINFER_SERVER:-$repo_root/build-sm86/apps/ninfer-serve}"
+model="${NINFER_MODEL:-/home/devonc/ai/models/ninfer/Qwen3.8-27B-NInfer/qwen3_8_27b.ninfer}"
+host="${NINFER_HOST:-127.0.0.1}"
+port="${NINFER_PORT:-18080}"
+device="${NINFER_DEVICE:-1}"
+max_context="${NINFER_MAX_CONTEXT:-131072}"
+kv_capacity="${NINFER_KV_CAPACITY:-$max_context}"
+state_dir="${NINFER_SERVE_STATE_DIR:-${TMPDIR:-/tmp}/ninfer-serve}"
+pid_file="$state_dir/pid"
+log_file="$state_dir/server.log"
+request_log_file="$state_dir/requests.jsonl"
+health_url="http://$host:$port/health"
+
+if [[ ! -x "$server" ]]; then
+    printf 'Missing server executable: %s\n' "$server" >&2
+    printf '%s\n' 'Set NINFER_SERVER or build build-sm86/apps/ninfer-serve.' >&2
+    exit 1
+fi
+if [[ ! -f "$model" ]]; then
+    printf 'Missing model artifact: %s\n' "$model" >&2
+    printf '%s\n' 'Set NINFER_MODEL to the exact .ninfer artifact path.' >&2
+    exit 1
+fi
+
+if curl --fail --silent --show-error "$health_url" >/dev/null 2>&1; then
+    printf 'Server is already ready at http://%s:%s\n' "$host" "$port"
+    exit 0
+fi
+
+if [[ -f "$pid_file" ]] && kill -0 "$(<"$pid_file")" 2>/dev/null; then
+    printf 'A previous server process is still starting; see %s\n' "$log_file" >&2
+    exit 1
+fi
+
+mkdir -p "$state_dir"
+rm -f "$pid_file"
+: >"$request_log_file"
+
+"$server" "$model" \
+    --host "$host" --port "$port" --device "$device" \
+    --max-context "$max_context" --kv-capacity "$kv_capacity" \
+    --max-concurrency 1 --max-pending-requests 16 \
+    --prefill-chunk 1024 --kv-dtype int8 \
+    --spec mtp --draft-tokens 3 --lm-head-draft \
+    --default-max-tokens 8192 \
+    --request-log-jsonl "$request_log_file" \
+    >"$log_file" 2>&1 &
+server_pid=$!
+printf '%s\n' "$server_pid" >"$pid_file"
+
+for _ in {1..240}; do
+    if curl --fail --silent --show-error "$health_url" >/dev/null 2>&1; then
+        printf 'Server ready at http://%s:%s (pid %s)\n' "$host" "$port" "$server_pid"
+        exit 0
+    fi
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+        printf 'Server exited during startup; see %s\n' "$log_file" >&2
+        rm -f "$pid_file"
+        exit 1
+    fi
+    sleep 0.25
+done
+
+printf 'Timed out waiting for server readiness; see %s\n' "$log_file" >&2
+exit 1

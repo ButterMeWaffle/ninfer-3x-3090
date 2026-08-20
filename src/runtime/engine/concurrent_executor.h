@@ -3,6 +3,7 @@
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
 #include "ninfer/types.h"
+#include "core/device.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
@@ -41,8 +42,8 @@ public:
     using Plan     = typename Package::RequestPlan;
     using Clock    = std::chrono::steady_clock;
 
-    ConcurrentExecutor(Instance& instance, const EngineOptions& options)
-        : instance_(instance), max_concurrency_(options.max_concurrency),
+    ConcurrentExecutor(Instance& instance, DeviceContext& device, const EngineOptions& options)
+        : instance_(instance), device_(device.device), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -1093,6 +1094,7 @@ private:
     }
 
     void worker_loop() noexcept {
+        CUDA_CHECK(cudaSetDevice(device_));
         bool previous_unit_was_decode = false;
         for (;;) {
             {
@@ -1156,6 +1158,7 @@ private:
     }
 
     Instance& instance_;
+    const int device_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    printf 'Usage: %s "<prompt>"\n' "$0" >&2
+    exit 2
+fi
+
+host="${NINFER_HOST:-127.0.0.1}"
+port="${NINFER_PORT:-18080}"
+max_tokens="${NINFER_MAX_TOKENS:-8192}"
+state_dir="${NINFER_SERVE_STATE_DIR:-${TMPDIR:-/tmp}/ninfer-serve}"
+request_log_file="$state_dir/requests.jsonl"
+base_url="http://$host:$port"
+
+if ! [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'NINFER_MAX_TOKENS must be a positive integer; got %q\n' "$max_tokens" >&2
+    exit 2
+fi
+if ! curl --fail --silent --show-error "$base_url/health" >/dev/null; then
+    printf 'Server is not ready at %s; run ./serve-load first.\n' "$base_url" >&2
+    exit 1
+fi
+
+model="$(curl --fail --silent --show-error "$base_url/v1/models" | jq -er '.data[0].id')"
+payload="$(jq -cn \
+    --arg model "$model" \
+    --arg prompt "$1" \
+    --argjson max_tokens "$max_tokens" \
+    '{model: $model, messages: [{role: "user", content: $prompt}], max_tokens: $max_tokens}')"
+response="$(curl --fail --silent --show-error "$base_url/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    --data "$payload")"
+
+printf '%s\n' "$response" | jq -r '
+    if .error then
+        "server error: \(.error.message)" | halt_error(1)
+    else
+        .choices[0].message as $message |
+        ($message.reasoning_content // "" | select(length > 0)),
+        ($message.content // "")
+    end'
+
+if [[ -f "$request_log_file" ]]; then
+    stats="$(jq -c 'select(.event == "request_done")' "$request_log_file" | tail -n 1)"
+    if [[ -n "$stats" ]]; then
+        printf '%s\n' "$stats" | jq -r '
+            def rate(tokens; seconds):
+                if seconds > 0 then tokens / seconds else 0 end;
+            .result as $result |
+            .timings_seconds as $timings |
+            ($result.completion_tokens - 1 | if . > 0 then . else 0 end) as $decode_tokens |
+            "\n[stats] prompt=\($result.prompt_tokens) generated=\($result.completion_tokens) finish=\($result.finish_reason)",
+            "[stats] prefill=\(rate($result.computed_prefill_tokens; $timings.prefill) * 100 | round / 100) tok/s  decode=\(rate($decode_tokens; $timings.decode) * 100 | round / 100) tok/s  overall=\(rate($result.completion_tokens; $timings.prefill + $timings.decode) * 100 | round / 100) tok/s"
+        '
+    fi
+fi

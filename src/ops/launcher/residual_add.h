@@ -12,5 +12,6 @@ namespace ninfer::ops::detail {
 
 // Host entry; assumes inputs already validated by the wrapper.
 void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream);
+void residual_add_two_launch(const Tensor& a, const Tensor& b, Tensor& x, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

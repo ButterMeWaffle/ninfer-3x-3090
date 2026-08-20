@@ -10,6 +10,10 @@
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
+#include "core/device.h"
+#include "ops/launcher/residual_add.h"
+#include "ops/linear_add/q5/q5_linear_add_kernels.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -246,6 +250,92 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                        stream);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
                     stream);
+}
+
+void Variant::post_mixer_graph(const Tensor& hidden, const PostMixerWeights& weights,
+                               Tensor& residual, WorkspaceArena& primary_workspace,
+                               WorkspaceArena& secondary_workspace, const DeviceArena&,
+                               const DeviceArena&, DeviceContext& device) {
+    constexpr std::int32_t kPrimaryIntermediate   = 8192;
+    constexpr std::int32_t kSecondaryIntermediate = TextConfig::intermediate - kPrimaryIntermediate;
+    static_assert((kPrimaryIntermediate % 1024) == 0 &&
+                  (kSecondaryIntermediate % 1024) == 0);
+
+    if (!device.model_parallel() || device.active_rank() != 0 || hidden.ne[1] <= 0 ||
+        weights.gate_up.qtype != QType::Q4G64_F16S || weights.down.qtype != QType::Q5G64_F16S ||
+        weights.secondary_gate_up.qtype != QType::Q4G64_F16S ||
+        weights.secondary_down.qtype != QType::Q5G64_F16S ||
+        weights.secondary_gate_up.qdata == nullptr || weights.secondary_down.qdata == nullptr) {
+        throw std::invalid_argument(
+            "27B graph-parallel MLP requires two devices, Q4 gate/up, and Q5 down");
+    }
+
+    const std::int32_t tokens = hidden.ne[1];
+
+    auto primary_scope   = primary_workspace.scope();
+    Tensor primary_act =
+        primary_workspace.alloc(DType::BF16, {kPrimaryIntermediate, tokens});
+    Tensor primary_delta = primary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+    Tensor peer_delta    = primary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+
+    auto secondary_scope = secondary_workspace.scope();
+    Tensor secondary_hidden =
+        secondary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+    Tensor secondary_act =
+        secondary_workspace.alloc(DType::BF16, {kSecondaryIntermediate, tokens});
+    Tensor secondary_delta =
+        secondary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+
+    const int primary_device      = device.device_ids()[0];
+    const int secondary_device    = device.device_ids()[1];
+    cudaStream_t primary_stream   = device.stream_for_rank(0);
+    cudaEvent_t primary_ready     = device.fence_for_rank(0);
+    cudaEvent_t secondary_ready   = device.fence_for_rank(1);
+
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    const auto launch_gate_up = [&](const Tensor& input, const Weight& weight,
+                                    std::int32_t row_begin, Tensor& output, cudaStream_t stream) {
+        if (tokens == 1) {
+            ops::detail::q4_linear_swiglu_gemv_pair_shard_launch(
+                input, weight, row_begin, output, stream);
+        } else if (tokens <= 32) {
+            ops::detail::q4_linear_swiglu_small_t_shard_launch(input, weight, row_begin, output,
+                                                               stream);
+        } else {
+            ops::detail::q4_linear_swiglu_mma_shard_launch(input, weight, row_begin, output,
+                                                           stream);
+        }
+    };
+    const auto launch_down = [&](const Tensor& input, const Weight& weight,
+                                 std::int32_t row_begin, Tensor& output, cudaStream_t stream) {
+        if (tokens == 1) {
+            ops::detail::q5_linear_graph_partial_gemv_launch(input, weight, row_begin, output,
+                                                             stream);
+        } else {
+            ops::detail::q5_linear_graph_partial_mma_launch(input, weight, row_begin, output,
+                                                            stream);
+        }
+    };
+
+    launch_gate_up(hidden, weights.gate_up, 0, primary_act, primary_stream);
+    launch_down(primary_act, weights.down, 0, primary_delta, primary_stream);
+
+    {
+        ScopedDeviceRank secondary(device, 1);
+        cudaStream_t secondary_stream = device.stream;
+        CUDA_CHECK(cudaStreamWaitEvent(secondary_stream, primary_ready, 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(secondary_hidden.data, secondary_device, hidden.data,
+                                       primary_device, hidden.bytes(), secondary_stream));
+        launch_gate_up(secondary_hidden, weights.secondary_gate_up, 0, secondary_act,
+                       secondary_stream);
+        launch_down(secondary_act, weights.secondary_down, 0, secondary_delta, secondary_stream);
+        CUDA_CHECK(cudaEventRecord(secondary_ready, secondary_stream));
+    }
+
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+    CUDA_CHECK(cudaMemcpyPeerAsync(peer_delta.data, primary_device, secondary_delta.data,
+                                   secondary_device, peer_delta.bytes(), primary_stream));
+    ops::detail::residual_add_two_launch(primary_delta, peer_delta, residual, primary_stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,

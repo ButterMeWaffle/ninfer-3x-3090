@@ -46,7 +46,7 @@ ninfer_bench --weights <artifact.ninfer>
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
-          [--device <id>] [--no-cuda-graph] [--profile-measured]
+          [--device <id>|--devices <primary,secondary>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
 

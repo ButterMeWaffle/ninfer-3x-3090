@@ -170,7 +170,8 @@ void launch_q5_t1(const Tensor& x, const Weight& value_z_weight,
             static_cast<const std::uint8_t*>(value_z_weight.qhigh),
             static_cast<const std::uint8_t*>(value_z_weight.scales),
             static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
-            Q5GdnDecodeEpilogue<Publish>{value_epilogue, static_cast<__nv_bfloat16*>(z.data)}));
+            Q5GdnDecodeEpilogue<Publish>{value_epilogue, static_cast<__nv_bfloat16*>(z.data)}, 0,
+            -1));
     } else {
         q5_rowsplit_gemv_kernel<kValueZRows, kHidden, q5_rows_per_block, 2, true, false, true,
                                 kValueRows, Q5GdnDecodeEpilogue<Publish>, TriggerPdl, JoinPdl>

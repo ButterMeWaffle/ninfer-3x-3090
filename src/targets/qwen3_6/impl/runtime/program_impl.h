@@ -188,7 +188,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
+      persistent(plan.persistent.bytes),
+      workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
       round_host(sizeof(TokenId)),
       ordinary_host(
@@ -206,6 +207,20 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                       : std::nullopt) {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
+    }
+    if (device.model_parallel()) {
+        if constexpr (!Variant::supports_graph_parallel) {
+            throw std::invalid_argument(
+                "graph parallel execution is not supported by this target variant");
+        }
+        if (model.secondary_weights_arena == nullptr) {
+            throw std::invalid_argument(
+                "graph parallel execution requires device-local weight shards");
+        }
+        ScopedDeviceRank secondary(device, 1);
+        secondary_workspace_storage.emplace(plan.workspace.capacity);
+        secondary_work.emplace(DeviceSpan{secondary_workspace_storage->base(),
+                                          secondary_workspace_storage->capacity()});
     }
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.dflash() ||
@@ -311,6 +326,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    if (secondary_workspace_storage) {
+        ScopedDeviceRank secondary(device, 1);
+        (void)cudaStreamSynchronize(device.stream);
+        secondary_work.reset();
+        secondary_workspace_storage.reset();
+    }
 }
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
@@ -1006,7 +1027,10 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 }
 
 void ProgramImplCore::prepare_graphs() {
-    if (!use_cuda_graph) { return; }
+    // Multi-device graphs are intentionally disabled: CUDA stream capture cannot represent this
+    // cross-device schedule. Still execute one representative eager round so CUDA module loading
+    // and per-device kernel configuration remain startup work, as they are for graph mode.
+    if (!use_cuda_graph && !device.model_parallel()) { return; }
     SequenceState& sequence = sequences[0];
 
     std::vector<PagedKVAllocation> text_capture_allocations;
@@ -1186,7 +1210,8 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head,
+                                       secondary_work ? &*secondary_work : nullptr};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1203,20 +1228,22 @@ void ProgramImplCore::prepare_graphs() {
                                         nullptr);
         device.synchronize();
 
-        ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
-        for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
-            for (const GraphExecutionProfile planned : ordinary_profiles) {
-                ordinary_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
-                schedule::capture_ordinary_decode_batch(ordinary_state,
-                                                        static_cast<std::int32_t>(batch_size),
-                                                        envelope, profile.definition);
+        if (use_cuda_graph) {
+            ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
+            for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
+                for (const GraphExecutionProfile planned : ordinary_profiles) {
+                    ordinary_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+                    const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+                    schedule::capture_ordinary_decode_batch(
+                        ordinary_state, static_cast<std::int32_t>(batch_size), envelope,
+                        profile.definition);
+                }
             }
         }
     }
@@ -1235,19 +1262,21 @@ void ProgramImplCore::prepare_graphs() {
                                    nullptr);
         device.synchronize();
 
-        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                mtp_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
-                schedule::capture_mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+        if (use_cuda_graph) {
+            mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    mtp_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    schedule::capture_mtp_decode_batch(
+                        mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
+                        mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+                }
             }
         }
     }
@@ -1268,29 +1297,31 @@ void ProgramImplCore::prepare_graphs() {
                                       code_warm_target, nullptr);
         device.synchronize();
 
-        dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            const auto planned_profiles =
-                batch_size == 1 ? batch_one_profiles
-                                : dflash_graph_profiles(capacity, draft_window, batch_size);
-            validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                dflash_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
-                const ops::GqaExecutionEnvelope target_envelope{
-                    1,
-                    static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                        capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
+        if (use_cuda_graph) {
+            dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                const auto planned_profiles =
+                    batch_size == 1 ? batch_one_profiles
+                                    : dflash_graph_profiles(capacity, draft_window, batch_size);
+                validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    dflash_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    const ops::GqaExecutionEnvelope target_envelope{
+                        1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                               capacity,
+                               static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
 
-                schedule::capture_dflash_decode_batch(
-                    dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
-                    profile.definition);
+                    schedule::capture_dflash_decode_batch(
+                        dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
+                        dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
+                        profile.definition);
+                }
             }
         }
     }
@@ -1298,10 +1329,10 @@ void ProgramImplCore::prepare_graphs() {
     if (!ordinary_graphs.profiles.empty()) {
         instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative);
     }
-    if (speculative_backend == SpeculativeBackend::Mtp) {
+    if (use_cuda_graph && speculative_backend == SpeculativeBackend::Mtp) {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
     }
-    if (speculative_backend == SpeculativeBackend::DFlash) {
+    if (use_cuda_graph && speculative_backend == SpeculativeBackend::DFlash) {
         instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);
     }
 
@@ -1336,8 +1367,8 @@ void ProgramImplCore::prepare_graphs() {
     std::size_t free_after = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_after, &total_bytes));
     const std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
-    graph_observed_bytes       = consumed;
-    if (consumed > graph_allowance_bytes) {
+    graph_observed_bytes       = use_cuda_graph ? consumed : 0;
+    if (use_cuda_graph && consumed > graph_allowance_bytes) {
         throw std::runtime_error("CUDA Graph preparation consumed " + std::to_string(consumed) +
                                  " bytes, exceeding the planned allowance of " +
                                  std::to_string(graph_allowance_bytes) + " bytes");
@@ -1449,7 +1480,8 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
                                          replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head},
+                                         prefill_hidden, prefill_chunk, proposal_head,
+                                         secondary_work ? &*secondary_work : nullptr},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
@@ -1482,7 +1514,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, secondary_work ? &*secondary_work : nullptr},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1743,7 +1775,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, secondary_work ? &*secondary_work : nullptr},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -1874,7 +1906,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  prefill_hidden, prefill_chunk, proposal_head,
+                                                  secondary_work ? &*secondary_work : nullptr},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2036,7 +2069,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head},
+                                                     proposal_head,
+                                                     secondary_work ? &*secondary_work : nullptr},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,
@@ -2164,6 +2198,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
 MemorySummary ProgramImplCore::memory_summary() const noexcept {
     MemorySummary out;
     out.device      = device.device;
+    out.devices     = device.device_ids();
     out.max_context = capacity;
     out.kv_capacity = kv_capacity;
     out.kv_cache = kv_dtype == DType::BF16
@@ -2172,9 +2207,20 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
                                       : KvCacheStorage::Int8Group64);
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
+    if (model.secondary_weights_arena != nullptr) {
+        DeviceArena& secondary_weights = *model.secondary_weights_arena;
+        out.secondary_weights = ArenaMemorySummary{secondary_weights.capacity(),
+                                                   secondary_weights.used(),
+                                                   secondary_weights.peak_used()};
+    }
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
     out.workspace = ArenaMemorySummary{workspace_storage.capacity(), work.used(), work.peak_used()};
+    if (secondary_workspace_storage) {
+        out.secondary_workspace = ArenaMemorySummary{secondary_workspace_storage->capacity(),
+                                                     secondary_work->used(),
+                                                     secondary_work->peak_used()};
+    }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
@@ -2184,8 +2230,12 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
 
 void ProgramImplCore::reset_memory_peaks() noexcept {
     model.weights_arena->reset_peak();
+    if (model.secondary_weights_arena != nullptr) {
+        model.secondary_weights_arena->reset_peak();
+    }
     persistent.reset_peak();
     work.reset_peak();
+    if (secondary_work) { secondary_work->reset_peak(); }
     workspace_logical_peak_bytes = 0;
 }
 

@@ -75,20 +75,25 @@ int main() {
     load.upload_seconds       = 0.345678901234;
     load.artifact_bytes_read  = 1000;
     load.host_to_device_bytes = 900;
+    load.peer_to_peer_bytes   = 800;
     load.peak_staging_bytes   = 128;
     load.tensor_count         = 42;
     load.resource_count       = 6;
 
     ninfer::MemorySummary memory;
+    memory.device                            = 1;
+    memory.devices                           = {1, 2};
     memory.max_context                       = 262144;
     memory.kv_capacity_mode                  = ninfer::KvCapacityMode::Explicit;
     memory.kv_capacity                       = 524288;
     memory.kv_capacity_page_groups           = 8192;
     memory.kv_capacity_max_page_groups       = 16384;
     memory.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
-    memory.weights.capacity_bytes            = 100;
-    memory.sequence.capacity_bytes           = 200;
-    memory.workspace.capacity_bytes          = 300;
+    memory.weights.capacity_bytes             = 100;
+    memory.secondary_weights.capacity_bytes   = 150;
+    memory.sequence.capacity_bytes            = 200;
+    memory.workspace.capacity_bytes           = 300;
+    memory.secondary_workspace.capacity_bytes = 350;
     memory.request_transient                 = {500, 0, 450};
     memory.minimum_runtime_reservation_bytes = 1300;
     memory.kv_capacity_increment_bytes       = 100;
@@ -125,7 +130,11 @@ int main() {
     failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
                       "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
+    failures += check(server.at("artifact").at("peer_to_peer_bytes") == 800,
+                      "peer-to-peer materialization bytes missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
+    failures += check(server.at("engine").at("devices") == Json::array({1, 2}),
+                      "ordered CUDA devices missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
                           server.at("engine").at("kv_capacity_page_groups") == 8192 &&
@@ -159,6 +168,10 @@ int main() {
     failures += check(server.at("memory").at("request_transient").at("capacity_bytes") == 500 &&
                           server.at("memory").at("request_transient").at("peak_used_bytes") == 450,
                       "request transient memory missing");
+    failures += check(
+        server.at("memory").at("secondary_weights").at("capacity_bytes") == 150 &&
+            server.at("memory").at("secondary_workspace").at("capacity_bytes") == 350,
+        "secondary device memory missing");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&

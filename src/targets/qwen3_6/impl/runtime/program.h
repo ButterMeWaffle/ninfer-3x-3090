@@ -250,6 +250,8 @@ public:
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    std::optional<DeviceArena> secondary_workspace_storage;
+    std::optional<WorkspaceArena> secondary_work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;

@@ -14,6 +14,20 @@
 namespace ninfer {
 namespace {
 
+EngineOptions normalize_engine_options(EngineOptions options) {
+    if (options.devices.empty()) {
+        options.devices.push_back(options.device);
+    } else {
+        options.device = options.devices.front();
+    }
+    if (options.devices.size() > 1) {
+        // DecodeGraphDefinition is a single-device capture. The eager model-parallel schedule owns
+        // its explicit cross-device dependencies until multi-device capture has a separate contract.
+        options.use_cuda_graph = false;
+    }
+    return options;
+}
+
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
     runtime::ResolvedRequestOptions resolved;
@@ -125,7 +139,7 @@ public:
         std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(std::move(engine_options)), device(options.device) {
+        : options(normalize_engine_options(std::move(engine_options))), device(options.devices) {
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
@@ -135,9 +149,9 @@ public:
                 using Instance =
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    return std::make_unique<Executor27>(*target_ptr, options);
+                    return std::make_unique<Executor27>(*target_ptr, device, options);
                 } else {
-                    return std::make_unique<Executor35>(*target_ptr, options);
+                    return std::make_unique<Executor35>(*target_ptr, device, options);
                 }
             },
             active);

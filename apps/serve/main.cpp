@@ -65,12 +65,23 @@ int main(int argc, char** argv) {
         const auto load_start = Clock::now();
         ninfer::serve::GenerationService service(options, load_progress.callback());
         server.attach(service);
+        const ninfer::LoadSummary load     = service.load_summary();
+        const ninfer::MemorySummary memory = service.memory_summary();
         std::ostringstream loaded;
         loaded << "model loaded in "
-               << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";
+               << std::chrono::duration<double>(Clock::now() - load_start).count() << " s"
+               << " H2D=" << format_bytes(load.host_to_device_bytes)
+               << " peer=" << format_bytes(load.peer_to_peer_bytes)
+               << " primary-weights=" << format_bytes(memory.weights.capacity_bytes);
+        if (memory.devices.size() > 1) {
+            loaded << " devices=" << memory.devices[0] << ',' << memory.devices[1];
+        }
+        if (memory.secondary_weights.capacity_bytes != 0) {
+            loaded << " secondary-weights="
+                   << format_bytes(memory.secondary_weights.capacity_bytes);
+        }
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
 
-        const ninfer::MemorySummary memory = service.memory_summary();
         std::ostringstream capacity;
         capacity << "KV capacity "
                  << (memory.kv_capacity_mode == ninfer::KvCapacityMode::Automatic ? "auto"

@@ -130,6 +130,15 @@ measured recommendation rather than a semantic limit.
 
 ## Common options
 
+For a dense 27B groupwise artifact, `--devices PRIMARY,SECONDARY` enables the dual-SM86 graph
+split. The ordered CUDA devices must have the same compute capability and bidirectional peer
+access. It is mutually exclusive with `--device`; see the
+[Linux NVLink guide](rtx-3090-linux.md#dual-3090-nvlink) before choosing indices on a mixed-GPU
+system. The main-model Q4/Q5 MLP weights are physically split 8,192/9,216 across the two devices.
+Prefill, decode, and MTP verification all execute the two MLP shards and reduce the secondary partial over
+the peer link. Attention, KV state, and the output path remain primary-owned. Cross-device CUDA
+Graph capture is disabled.
+
 | Option | Meaning | Default |
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
@@ -137,6 +146,7 @@ measured recommendation rather than a semantic limit.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
+| `--devices N,M` | ordered primary and secondary CUDA devices for dense-27B graph parallelism | unset |
 | `--kv-dtype bf16\|int8\|rk8v4` | KV-cache storage; `rk8v4` is experimental and lossy | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |

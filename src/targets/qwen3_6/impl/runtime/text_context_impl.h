@@ -223,10 +223,12 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
                          qwen3_6::PagedKVCacheView mtp_kv,
                          const qwen3_6::PagedKVCache* batch_text_kv,
-                         const qwen3_6::PagedKVCache* batch_mtp_kv)
-    : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
-      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
-      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
+                         const qwen3_6::PagedKVCache* batch_mtp_kv,
+                         WorkspaceArena* secondary_work)
+    : ctx_(ctx), weights_(weights), work_(work), secondary_work_(secondary_work), kv_(kv),
+      mtp_kv_(mtp_kv), batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv), state_(state),
+      io_(io), prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk),
+      text_kv_base_(text_kv_base) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -808,8 +810,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
-                                  s);
+    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph,
+                                  work_, s);
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -842,8 +844,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                            *active_gqa_envelope_, work_, a_batch, s);
     } else {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
-                           batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
-                           s);
+                           batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_,
+                           work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -961,12 +963,33 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
+    if constexpr (Variant::supports_graph_parallel) {
+        if (ctx_.model_parallel()) {
+            if (secondary_work_ == nullptr) {
+                throw std::logic_error("graph-parallel MLP has no secondary workspace");
+            }
+            if (weights_.weights_arena == nullptr || weights_.secondary_weights_arena == nullptr) {
+                throw std::logic_error("graph-parallel MLP has no device-local weight shards");
+            }
+            Variant::post_mixer_graph(h, *m.payload, x, work_, *secondary_work_,
+                                      *weights_.weights_arena,
+                                      *weights_.secondary_weights_arena, ctx_);
+            return;
+        }
+    }
+
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    if (ctx_.model_parallel()) {
+        if (ctx_.active_rank() != 0 || secondary_work_ == nullptr) {
+            throw std::logic_error("graph-parallel traversal requires primary entry and workspace");
+        }
+        secondary_work_->reset();
+    }
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);

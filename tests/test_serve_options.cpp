@@ -55,6 +55,19 @@ int main() {
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
 
+    const ServeOptions graph_devices =
+        parse({"ninfer-serve", "model.ninfer", "--devices", "1,2"});
+    failures += check(graph_devices.devices == std::vector<int>({1, 2}) &&
+                          graph_devices.device == 1 && !graph_devices.use_cuda_graph,
+                      "--devices did not select the ordered eager graph-parallel route");
+    bool mixed_device_flags_rejected = false;
+    try {
+        (void)parse(
+            {"ninfer-serve", "model.ninfer", "--device", "1", "--devices", "1,2"});
+    } catch (const std::invalid_argument&) { mixed_device_flags_rejected = true; }
+    failures +=
+        check(mixed_device_flags_rejected, "--device and --devices were accepted together");
+
     const ServeOptions rotor =
         parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "rk8v4"});
     failures += check(

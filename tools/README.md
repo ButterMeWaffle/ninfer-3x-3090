@@ -22,6 +22,7 @@ for the selected tool.
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
+| Map CUDA indices and peer access | [`multi_gpu_probe.cu`](multi_gpu_probe.cu) |
 
 ## Artifact workflow
 

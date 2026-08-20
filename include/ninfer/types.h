@@ -71,6 +71,9 @@ struct LoadProgress {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
+    // One entry preserves the single-GPU route. Two entries enable graph parallelism in the
+    // listed CUDA order (primary/reduction device, secondary shard device).
+    std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
@@ -373,6 +376,7 @@ struct ArenaMemorySummary {
 
 struct MemorySummary {
     int device                                = 0;
+    std::vector<int> devices;
     std::uint32_t max_context                 = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
@@ -380,8 +384,10 @@ struct MemorySummary {
     std::uint32_t kv_capacity_max_page_groups = 0;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
     ArenaMemorySummary weights;
+    ArenaMemorySummary secondary_weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
+    ArenaMemorySummary secondary_workspace;
     ArenaMemorySummary request_transient;
     std::size_t minimum_runtime_reservation_bytes = 0;
     std::size_t kv_capacity_increment_bytes       = 0;
@@ -420,6 +426,7 @@ struct LoadSummary {
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;
     std::uint64_t host_to_device_bytes = 0;
+    std::uint64_t peer_to_peer_bytes   = 0;
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t tensor_count           = 0;
     std::size_t resource_count         = 0;

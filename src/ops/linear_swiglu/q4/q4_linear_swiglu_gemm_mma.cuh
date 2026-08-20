@@ -20,7 +20,8 @@ __global__
 __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split_half_pair_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
-    std::int32_t intermediate, std::int32_t k, std::int32_t t, std::int32_t padded_k) {
+    std::int32_t output_rows, std::int32_t parent_intermediate, std::int32_t row_begin,
+    std::int32_t k, std::int32_t t, std::int32_t padded_k) {
     constexpr int BM   = Cfg::BM;
     constexpr int BN   = Cfg::BN;
     constexpr int BK   = Cfg::BK;
@@ -89,7 +90,9 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
         }
     };
 
-    auto global_row = [&](int row) { return m0 + (row & (PM - 1)) + (row / PM) * intermediate; };
+    auto global_row = [&](int row) {
+        return row_begin + m0 + (row & (PM - 1)) + (row / PM) * parent_intermediate;
+    };
 
     auto stage_load_quant = [&](int stage, int kt) {
         const int g = (kt * BK) >> 6;
@@ -102,7 +105,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
             if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
                 gemm_cp_async<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
-            } else if (m0 + (row & (PM - 1)) < intermediate) {
+            } else if (m0 + (row & (PM - 1)) < output_rows) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
                 gemm_cp_async<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
             } else {
@@ -124,7 +127,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
                         *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
                     *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
                 }
-            } else if (m0 + (row & (PM - 1)) < intermediate) {
+            } else if (m0 + (row & (PM - 1)) < output_rows) {
                 const int aligned_g           = g & ~1;
                 const std::int64_t gi         = static_cast<std::int64_t>(grow) * kg + g;
                 const std::int64_t aligned_gi = static_cast<std::int64_t>(grow) * kg + aligned_g;
@@ -211,7 +214,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
             const int cc0 = t0 + wn * WN + ni * 8 + 2 * lid;
             const int cc1 = cc0 + 1;
             auto store    = [&](int col, int row, float gv, float uv) {
-                out[static_cast<std::int64_t>(col) * intermediate + row] =
+                out[static_cast<std::int64_t>(col) * output_rows + row] =
                     __float2bfloat16_rn(silu(gv) * uv);
             };
             if constexpr (FullTiles) {
@@ -220,11 +223,11 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
                 store(cc0, r1, acc[mi][ni][2], acc[mi + MT / 2][ni][2]);
                 store(cc1, r1, acc[mi][ni][3], acc[mi + MT / 2][ni][3]);
             } else {
-                if (r0 < intermediate) {
+                if (r0 < output_rows) {
                     if (cc0 < t) { store(cc0, r0, acc[mi][ni][0], acc[mi + MT / 2][ni][0]); }
                     if (cc1 < t) { store(cc1, r0, acc[mi][ni][1], acc[mi + MT / 2][ni][1]); }
                 }
-                if (r1 < intermediate) {
+                if (r1 < output_rows) {
                     if (cc0 < t) { store(cc0, r1, acc[mi][ni][2], acc[mi + MT / 2][ni][2]); }
                     if (cc1 < t) { store(cc1, r1, acc[mi][ni][3], acc[mi + MT / 2][ni][3]); }
                 }

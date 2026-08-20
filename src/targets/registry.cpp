@@ -6,8 +6,10 @@
 #include "core/device.h"
 #include "runtime/engine/kv_capacity.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -59,17 +61,51 @@ artifact::LoadProgress artifact_progress(const LoadProgress& progress) {
     return artifact::LoadProgress{.callback = progress.callback};
 }
 
-std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
+std::size_t free_device_bytes(DeviceContext& device, std::size_t rank) {
+    ScopedDeviceRank scope(device, rank);
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    if (weight_bytes > free_bytes) {
-        throw std::invalid_argument("model weights require " + std::to_string(weight_bytes) +
-                                    " bytes of device memory, but only " +
-                                    std::to_string(free_bytes) +
-                                    " bytes are free before loading weights");
+    return free_bytes;
+}
+
+void require_load_capacity(const DeviceContext& device, std::size_t rank,
+                           std::uint64_t required, std::size_t available) {
+    if (required > available) {
+        throw std::invalid_argument(
+            "weight materialization on CUDA device " +
+            std::to_string(device.device_ids().at(rank)) + " (rank " +
+            std::to_string(rank) + ") peaks at " + std::to_string(required) +
+            " bytes, but only " + std::to_string(available) +
+            " bytes are free before loading weights");
     }
-    return free_bytes - static_cast<std::size_t>(weight_bytes);
+}
+
+std::size_t runtime_bytes_after_planned_weights(
+    const artifact::MaterializationPlan& plan, DeviceContext& device) {
+    const std::uint64_t primary_final = plan.device_capacity_bytes;
+    const std::uint64_t primary_source = plan.source_device_capacity_bytes == 0
+                                             ? primary_final
+                                             : plan.source_device_capacity_bytes;
+    const std::uint64_t primary_peak = std::max(primary_final, primary_source);
+    const std::size_t primary_free   = free_device_bytes(device, 0);
+    require_load_capacity(device, 0, primary_peak, primary_free);
+
+    if (device.model_parallel()) {
+        std::uint64_t secondary_peak = primary_source;
+        if (!plan.row_split_shards.empty()) {
+            if (plan.secondary_device_capacity_bytes >
+                std::numeric_limits<std::uint64_t>::max() - primary_final) {
+                throw std::invalid_argument(
+                    "secondary weight materialization peak overflows u64");
+            }
+            secondary_peak = primary_final + plan.secondary_device_capacity_bytes;
+        }
+        const std::size_t secondary_free = free_device_bytes(device, 1);
+        require_load_capacity(device, 1, secondary_peak, secondary_free);
+    }
+
+    return primary_free - static_cast<std::size_t>(primary_final);
 }
 
 std::size_t current_free_device_bytes() {
@@ -92,7 +128,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const std::size_t preflight_runtime_bytes =
-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
+        runtime_bytes_after_planned_weights(load_plan.materialization(), device);
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
 
     auto progress     = artifact_progress(options.load_progress);
@@ -123,6 +159,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.file_bytes;
     summary.host_to_device_bytes = stats.h2d_bytes;
+    summary.peer_to_peer_bytes   = stats.peer_to_peer_bytes;
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
@@ -172,6 +209,15 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (device.model_parallel() && identity.model_id == Qwen3_6_35BA3B::model_id) {
+        throw std::invalid_argument(
+            "graph parallel execution currently supports only the dense 27B target");
+    }
+    if (device.model_parallel() && identity.model_id == Qwen3_6_27B::model_id &&
+        identity.weights_id == "nvfp4") {
+        throw std::invalid_argument(
+            "graph parallel 27B execution requires the groupwise-int artifact");
+    }
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start, Qwen3_6_27B::target_key);

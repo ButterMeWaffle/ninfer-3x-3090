@@ -426,6 +426,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
+| `--devices N,M` | ordered primary and secondary CUDA devices for dense-27B graph parallelism | unset |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
@@ -458,6 +459,14 @@ Frequency penalty is `0` for all registered presets. Process flags override regi
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
+
+`--devices PRIMARY,SECONDARY` requires two same-compute-capability devices with bidirectional peer
+access and is mutually exclusive with `--device`. For the dense 27B groupwise target, the server
+physically splits the main-model Q4/Q5 MLP weights 8,192/9,216 across the GPUs. Prefill, decode,
+and MTP verification execute both shards and reduce the secondary partial over the peer link.
+Attention and KV state remain primary-owned. Multi-device CUDA Graph capture is disabled; startup
+performs an eager warm round instead. See the
+[Linux NVLink guide](rtx-3090-linux.md#dual-3090-nvlink) for mixed-GPU CUDA index discovery.
 
 ## Structured request log
 

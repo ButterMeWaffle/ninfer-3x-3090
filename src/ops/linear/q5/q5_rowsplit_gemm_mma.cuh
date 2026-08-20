@@ -118,7 +118,9 @@ void q5_rowsplit_gemm_mma_kernel(
     std::int32_t rows,
     std::int32_t k,
     std::int32_t cols,
-    std::int32_t padded_k) {
+    std::int32_t padded_k,
+    std::int32_t weight_k_tile_begin = 0,
+    std::int32_t weight_k_tile_count = -1) {
     // clang-format on
     using Schedule = Schedule_;
     static_assert(Epilogue == Q5MmaEpilogue::Store || Epilogue == Q5MmaEpilogue::AddResidual ||
@@ -168,7 +170,7 @@ void q5_rowsplit_gemm_mma_kernel(
         }
     }
 
-    const int k_tiles = padded_k / BK;
+    const int k_tiles = weight_k_tile_count < 0 ? padded_k / BK : weight_k_tile_count;
 
     const int a_matrix     = lane >> 3;
     const int a_inner_row  = lane & 7;
@@ -201,7 +203,8 @@ void q5_rowsplit_gemm_mma_kernel(
     };
 
     auto stage_quant = [&](int stage, int k_tile) {
-        const int group0 = (k_tile * BK) / Q5RowSplitStorage::kGroupK;
+        const int global_k_tile = weight_k_tile_begin + k_tile;
+        const int group0 = (global_k_tile * BK) / Q5RowSplitStorage::kGroupK;
 #pragma unroll 1
         for (int item = tid; item < BM * GPB * 2; item += Schedule::kThreads) {
             const int row_group = item >> 1;
@@ -318,7 +321,8 @@ void q5_rowsplit_gemm_mma_kernel(
     };
 
     auto decode_weight = [&](int stage, int k_tile) {
-        const int scale_group = (k_tile * BK) / Q5RowSplitStorage::kGroupK;
+        const int global_k_tile = weight_k_tile_begin + k_tile;
+        const int scale_group = (global_k_tile * BK) / Q5RowSplitStorage::kGroupK;
         for (int local_row = warp; local_row < BM; local_row += Schedule::kWarps) {
             auto* dst = &As[local_row * BK];
 #pragma unroll

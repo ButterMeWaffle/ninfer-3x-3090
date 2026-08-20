@@ -20,10 +20,11 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
-    static const cudaError_t attr_bf16 =
-        cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
-    CUDA_CHECK(attr_bf16);
+    configure_cuda_device_once([] {
+        return cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kGqaPrefillSmemBytes);
+    });
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillI8Br)),
@@ -31,10 +32,11 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
         const auto launch_i8 = [&]<bool PackedV, bool RotateK, bool RotateV>() {
-            static const cudaError_t attr_i8 = cudaFuncSetAttribute(
-                gqa_attention_prefill_i8_kernel<Geometry, PackedV, RotateK, RotateV, Metadata>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
-            CUDA_CHECK(attr_i8);
+            configure_cuda_device_once([] {
+                return cudaFuncSetAttribute(
+                    gqa_attention_prefill_i8_kernel<Geometry, PackedV, RotateK, RotateV, Metadata>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
+            });
             gqa_attention_prefill_i8_kernel<Geometry, PackedV, RotateK, RotateV, Metadata>
                 <<<attention_grid, kGqaPrefillI8Threads, kGqaPrefillI8SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
