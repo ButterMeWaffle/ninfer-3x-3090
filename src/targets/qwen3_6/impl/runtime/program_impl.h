@@ -186,7 +186,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       kv_packed_v(plan.kv_packed_v), kv_rotate_k(plan.kv_rotate_k), kv_rotate_v(plan.kv_rotate_v),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      use_cuda_graph(plan.use_cuda_graph),
+      kv_payload_bytes(plan.persistent.kv_payload_bytes +
+                       (plan.secondary_persistent
+                            ? plan.secondary_persistent->kv_payload_bytes
+                            : 0)),
+      secondary_kv_payload_bytes(plan.secondary_persistent
+                                     ? plan.secondary_persistent->kv_payload_bytes
+                                     : 0),
+      primary_attention_layers(plan.persistent.decoder.text_kv.layers),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes),
       workspace_storage(plan.workspace.capacity),
@@ -217,7 +225,20 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             throw std::invalid_argument(
                 "graph parallel execution requires device-local weight shards");
         }
+        if (!plan.secondary_persistent) {
+            throw std::invalid_argument(
+                "graph parallel execution requires a secondary KV layout");
+        }
         ScopedDeviceRank secondary(device, 1);
+        secondary_persistent_storage.emplace(plan.secondary_persistent->bytes);
+        const DeviceSpan secondary_backing = secondary_persistent_storage->alloc_bytes(
+            plan.secondary_persistent->bytes, 256);
+        secondary_text_kv = std::make_unique<qwen3_6::PagedKVCache>(
+            secondary_backing, plan.secondary_persistent->text_kv);
+        if (plan.secondary_persistent->mtp_kv) {
+            secondary_mtp_kv = std::make_unique<qwen3_6::PagedKVCache>(
+                secondary_backing, *plan.secondary_persistent->mtp_kv);
+        }
         secondary_workspace_storage.emplace(plan.workspace.capacity);
         secondary_work.emplace(DeviceSpan{secondary_workspace_storage->base(),
                                           secondary_workspace_storage->capacity()});
@@ -325,10 +346,20 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
-    if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    if (device.stream != nullptr) {
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            ScopedDeviceRank scope(device, rank);
+            (void)cudaStreamSynchronize(device.stream);
+        }
+    }
+    // Sequence allocations hold raw pool owners. Release every retained/pending bundle before
+    // destroying either device's Paged KV cache.
+    for (SequenceState& sequence : sequences) { sequence.kv.reset(); }
     if (secondary_workspace_storage) {
         ScopedDeviceRank secondary(device, 1);
-        (void)cudaStreamSynchronize(device.stream);
+        secondary_mtp_kv.reset();
+        secondary_text_kv.reset();
+        secondary_persistent_storage.reset();
         secondary_work.reset();
         secondary_workspace_storage.reset();
     }
@@ -349,6 +380,11 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
     if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
+        return false;
+    }
+    if (secondary_text_kv != nullptr &&
+        !can_replace(secondary_text_kv->pool(), old_text,
+                     plan.impl_->text_kv_page_entitlement)) {
         return false;
     }
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
@@ -391,6 +427,11 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     const SequenceState& sequence = sequences[lane];
     const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
     if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
+                     plan.impl_->text_kv_page_entitlement)) {
+        return false;
+    }
+    if (secondary_text_kv != nullptr &&
+        !can_replace(secondary_text_kv->pool(), old_text, reclaimable_text,
                      plan.impl_->text_kv_page_entitlement)) {
         return false;
     }
@@ -863,15 +904,24 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
 }
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
-    if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        return decoder->mtp_cache() != nullptr ? decoder->mtp_cache() : secondary_mtp_kv.get();
+    }
     if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
     return nullptr;
 }
 
 const qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() const noexcept {
-    if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        return decoder->mtp_cache() != nullptr ? decoder->mtp_cache() : secondary_mtp_kv.get();
+    }
     if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
     return nullptr;
+}
+
+bool ProgramImplCore::backend_kv_on_secondary() const noexcept {
+    return speculative_backend == SpeculativeBackend::Mtp && decoder->mtp_cache() == nullptr &&
+           secondary_mtp_kv != nullptr;
 }
 
 std::uint32_t ProgramImplCore::backend_kv_valid(const SequenceState& sequence) const noexcept {
@@ -889,12 +939,18 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
         throw std::invalid_argument("KV allocation entitlement does not match the active backend");
     }
 
-    std::array<PagedKVReservation, 2> reservations{};
+    std::array<PagedKVReservation, 3> reservations{};
     std::size_t count     = 0;
     reservations[count++] = PagedKVReservation{
         .pool             = &decoder->text_kv.pool(),
         .page_entitlement = text_pages,
     };
+    if (secondary_text_kv != nullptr) {
+        reservations[count++] = PagedKVReservation{
+            .pool             = &secondary_text_kv->pool(),
+            .page_entitlement = text_pages,
+        };
+    }
     if (qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
         reservations[count++] = PagedKVReservation{
             .pool             = &backend->pool(),
@@ -905,8 +961,14 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
     std::vector<PagedKVAllocation> allocations =
         reserve_paged_kv_bundle(std::span<const PagedKVReservation>(reservations.data(), count));
     SequenceKVBundle bundle;
-    bundle.text = std::move(allocations[0]);
-    if (count == 2) { bundle.backend.emplace(std::move(allocations[1])); }
+    std::size_t allocation = 0;
+    bundle.text            = std::move(allocations[allocation++]);
+    if (secondary_text_kv != nullptr) {
+        bundle.secondary_text.emplace(std::move(allocations[allocation++]));
+    }
+    if (backend_kv_cache() != nullptr) {
+        bundle.backend.emplace(std::move(allocations[allocation++]));
+    }
     sequence.kv.emplace(std::move(bundle));
 }
 
@@ -917,13 +979,23 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
         (sequence.kv->backend.has_value() != (backend_pages != 0))) {
         throw std::invalid_argument("KV resize entitlement does not match the sequence bundle");
     }
-    std::array<PagedKVResize, 2> changes{};
+    if (sequence.kv->secondary_text.has_value() != (secondary_text_kv != nullptr)) {
+        throw std::invalid_argument("secondary KV resize entitlement does not match graph mode");
+    }
+    std::array<PagedKVResize, 3> changes{};
     std::size_t count = 0;
     changes[count++]  = PagedKVResize{
          .allocation       = &sequence.kv->text,
          .mapped_pages     = sequence.kv->text.mapped_page_count(),
          .page_entitlement = text_pages,
     };
+    if (sequence.kv->secondary_text) {
+        changes[count++] = PagedKVResize{
+            .allocation       = &*sequence.kv->secondary_text,
+            .mapped_pages     = sequence.kv->secondary_text->mapped_page_count(),
+            .page_entitlement = text_pages,
+        };
+    }
     if (sequence.kv->backend) {
         changes[count++] = PagedKVResize{
             .allocation       = &*sequence.kv->backend,
@@ -936,19 +1008,34 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
 
 void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
     if (!sequence.kv || sequence.kv->text.bound_row() >= 0 ||
+        (sequence.kv->secondary_text && sequence.kv->secondary_text->bound_row() >= 0) ||
         (sequence.kv->backend && sequence.kv->backend->bound_row() >= 0)) {
         throw std::logic_error("KV allocation bundle is unavailable or already bound");
     }
     const std::int32_t row = static_cast<std::int32_t>(sequence.lane);
     sequence.kv->text.bind_row(row, device.stream);
     try {
-        if (sequence.kv->backend) { sequence.kv->backend->bind_row(row, device.stream); }
+        if (sequence.kv->secondary_text || backend_kv_on_secondary()) {
+            ScopedDeviceRank secondary(device, 1);
+            if (sequence.kv->secondary_text) {
+                sequence.kv->secondary_text->bind_row(row, device.stream);
+            }
+            if (sequence.kv->backend && backend_kv_on_secondary()) {
+                sequence.kv->backend->bind_row(row, device.stream);
+            }
+        }
+        if (sequence.kv->backend && !backend_kv_on_secondary()) {
+            sequence.kv->backend->bind_row(row, device.stream);
+        }
         set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
         set_device_i32(io.backend_kv_table_row,
                        sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
     } catch (...) {
         if (sequence.kv->backend && sequence.kv->backend->bound_row() >= 0) {
             sequence.kv->backend->unbind_row();
+        }
+        if (sequence.kv->secondary_text && sequence.kv->secondary_text->bound_row() >= 0) {
+            sequence.kv->secondary_text->unbind_row();
         }
         sequence.kv->text.unbind_row();
         throw;
@@ -958,6 +1045,7 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
 void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     if (sequence.kv->backend) { sequence.kv->backend->unbind_row(); }
+    if (sequence.kv->secondary_text) { sequence.kv->secondary_text->unbind_row(); }
     sequence.kv->text.unbind_row();
 }
 
@@ -972,8 +1060,18 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     if (main_tokens > sequence.kv->text.mapped_token_capacity()) {
         sequence.kv->text.materialize_tokens(main_tokens, device.stream);
     }
+    if (sequence.kv->secondary_text &&
+        main_tokens > sequence.kv->secondary_text->mapped_token_capacity()) {
+        ScopedDeviceRank secondary(device, 1);
+        sequence.kv->secondary_text->materialize_tokens(main_tokens, device.stream);
+    }
     if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
-        sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
+        if (backend_kv_on_secondary()) {
+            ScopedDeviceRank secondary(device, 1);
+            sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
+        } else {
+            sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
+        }
     }
 }
 
@@ -986,12 +1084,16 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
         throw std::logic_error("backend KV trim requested without an allocation");
     }
     sequence.kv->text.trim_tokens(main_tokens);
+    if (sequence.kv->secondary_text) { sequence.kv->secondary_text->trim_tokens(main_tokens); }
     if (sequence.kv->backend) { sequence.kv->backend->trim_tokens(backend_tokens); }
 }
 
 void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     sequence.kv->text.cancel_unmapped_entitlement();
+    if (sequence.kv->secondary_text) {
+        sequence.kv->secondary_text->cancel_unmapped_entitlement();
+    }
     if (sequence.kv->backend) { sequence.kv->backend->cancel_unmapped_entitlement(); }
 }
 
@@ -1002,10 +1104,29 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
 
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
     if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
-    if (decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend) {
+    if (decoder->mtp_cache() == nullptr) { return {}; }
+    if (!sequence.kv || !sequence.kv->backend) {
         throw std::logic_error("sequence has no MTP KV allocation");
     }
     return decoder->mtp_cache()->execution_view(*sequence.kv->backend);
+}
+
+qwen3_6::PagedKVCacheView
+ProgramImplCore::secondary_text_kv_view(const SequenceState& sequence) const {
+    if (secondary_text_kv == nullptr) { return {}; }
+    if (!sequence.kv || !sequence.kv->secondary_text) {
+        throw std::logic_error("sequence has no secondary Text KV allocation");
+    }
+    return secondary_text_kv->execution_view(*sequence.kv->secondary_text);
+}
+
+qwen3_6::PagedKVCacheView
+ProgramImplCore::secondary_mtp_kv_view(const SequenceState& sequence) const {
+    if (secondary_mtp_kv == nullptr) { return {}; }
+    if (!sequence.kv || !sequence.kv->backend) {
+        throw std::logic_error("sequence has no secondary MTP KV allocation");
+    }
+    return secondary_mtp_kv->execution_view(*sequence.kv->backend);
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -1035,6 +1156,8 @@ void ProgramImplCore::prepare_graphs() {
 
     std::vector<PagedKVAllocation> text_capture_allocations;
     std::vector<PagedKVAllocation> mtp_capture_allocations;
+    std::vector<PagedKVAllocation> secondary_text_capture_allocations;
+    std::vector<PagedKVAllocation> secondary_mtp_capture_allocations;
     std::vector<PagedKVAllocation> dflash_capture_allocations;
     const auto reserve_capture_rows = [&](qwen3_6::PagedKVCache& cache,
                                           std::vector<PagedKVAllocation>& allocations,
@@ -1062,8 +1185,19 @@ void ProgramImplCore::prepare_graphs() {
         }
     };
     reserve_capture_rows(decoder->text_kv, text_capture_allocations, "target KV cache");
+    if (secondary_text_kv != nullptr) {
+        ScopedDeviceRank secondary(device, 1);
+        reserve_capture_rows(*secondary_text_kv, secondary_text_capture_allocations,
+                             "secondary target KV cache");
+    }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        reserve_capture_rows(*decoder->mtp_cache(), mtp_capture_allocations, "MTP KV cache");
+        if (backend_kv_on_secondary()) {
+            ScopedDeviceRank secondary(device, 1);
+            reserve_capture_rows(*secondary_mtp_kv, secondary_mtp_capture_allocations,
+                                 "secondary MTP KV cache");
+        } else {
+            reserve_capture_rows(*decoder->mtp_cache(), mtp_capture_allocations, "MTP KV cache");
+        }
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         reserve_capture_rows(dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
     }
@@ -1118,7 +1252,14 @@ void ProgramImplCore::prepare_graphs() {
         work.reset();
         clear_stable_controls();
         zero_capture_pages(decoder->text_kv, text_capture_allocations, batch_size);
-        if (decoder->mtp_cache() != nullptr) {
+        if (secondary_text_kv != nullptr) {
+            ScopedDeviceRank secondary(device, 1);
+            zero_capture_pages(*secondary_text_kv, secondary_text_capture_allocations, batch_size);
+        }
+        if (backend_kv_on_secondary()) {
+            ScopedDeviceRank secondary(device, 1);
+            zero_capture_pages(*secondary_mtp_kv, secondary_mtp_capture_allocations, batch_size);
+        } else if (decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), mtp_capture_allocations, batch_size);
         }
         if (dflash) { zero_capture_pages(dflash->full, dflash_capture_allocations, batch_size); }
@@ -1218,9 +1359,10 @@ void ProgramImplCore::prepare_graphs() {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
-        schedule::OrdinaryBatchContext ordinary_state{execution_core(),      decoder->text_kv,
-                                                      *io.ordinary,          *ordinary_host_ingress,
-                                                      *ordinary_host_egress, tail_hidden_store};
+        schedule::OrdinaryBatchContext ordinary_state{
+            execution_core(), decoder->text_kv, secondary_text_kv.get(),
+            static_cast<std::int32_t>(primary_attention_layers), *io.ordinary,
+            *ordinary_host_ingress, *ordinary_host_egress, tail_hidden_store};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();
@@ -1252,8 +1394,9 @@ void ProgramImplCore::prepare_graphs() {
         const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
         validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
         schedule::MtpBatchContext mtp_state{
-            execution_core(),  decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
-            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
+            execution_core(), decoder->text_kv, decoder->mtp_cache(), secondary_text_kv.get(),
+            secondary_mtp_kv.get(), static_cast<std::int32_t>(primary_attention_layers),
+            *io.mtp_decode, *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
         const GraphExecutionProfile code_warm = planned_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();
@@ -1284,7 +1427,8 @@ void ProgramImplCore::prepare_graphs() {
         const auto batch_one_profiles = dflash_graph_profiles(capacity, draft_window, 1);
         validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
         schedule::DFlashBatchContext dflash_state{
-            execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
+            execution_core(), decoder->text_kv, secondary_text_kv.get(),
+            static_cast<std::int32_t>(primary_attention_layers), *dflash, *io.dflash_decode,
             *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
@@ -1377,8 +1521,16 @@ void ProgramImplCore::prepare_graphs() {
     dflash_capture_allocations.clear();
     for (PagedKVAllocation& allocation : mtp_capture_allocations) { allocation.unbind_row(); }
     mtp_capture_allocations.clear();
+    for (PagedKVAllocation& allocation : secondary_mtp_capture_allocations) {
+        allocation.unbind_row();
+    }
+    secondary_mtp_capture_allocations.clear();
     for (PagedKVAllocation& allocation : text_capture_allocations) { allocation.unbind_row(); }
     text_capture_allocations.clear();
+    for (PagedKVAllocation& allocation : secondary_text_capture_allocations) {
+        allocation.unbind_row();
+    }
+    secondary_text_capture_allocations.clear();
 }
 
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
@@ -1517,8 +1669,13 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
              proposal_head, secondary_work ? &*secondary_work : nullptr},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
+            secondary_text_kv_view(sequence),
+            secondary_mtp_kv_view(sequence),
             decoder->text_kv,
             decoder->mtp_cache(),
+            secondary_text_kv.get(),
+            secondary_mtp_kv.get(),
+            static_cast<std::int32_t>(primary_attention_layers),
             dflash ? &*dflash : nullptr,
             staged.cursor,
             static_cast<const ops::SamplingConfig*>(
@@ -1775,8 +1932,10 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, secondary_work ? &*secondary_work : nullptr},
+            proposal_head, secondary_work ? &*secondary_work : nullptr},
             decoder->text_kv,
+            secondary_text_kv.get(),
+            static_cast<std::int32_t>(primary_attention_layers),
             *io.ordinary,
             *ordinary_host_ingress,
             *ordinary_host_egress,
@@ -1825,7 +1984,7 @@ runtime::BatchedGeneratedRound
 ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets) {
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
-        decoder->mtp_cache() == nullptr) {
+        backend_kv_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
     }
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
@@ -1907,9 +2066,13 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
-                                                  secondary_work ? &*secondary_work : nullptr},
+                                                 secondary_work ? &*secondary_work : nullptr},
                                                  decoder->text_kv,
-                                                 *decoder->mtp_cache(),
+                                                 decoder->mtp_cache(),
+                                                 secondary_text_kv.get(),
+                                                 secondary_mtp_kv.get(),
+                                                 static_cast<std::int32_t>(
+                                                     primary_attention_layers),
                                                  *io.mtp_decode,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
@@ -2070,8 +2233,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
                                                      proposal_head,
-                                                     secondary_work ? &*secondary_work : nullptr},
+                                                    secondary_work ? &*secondary_work : nullptr},
                                                     decoder->text_kv,
+                                                    secondary_text_kv.get(),
+                                                    static_cast<std::int32_t>(
+                                                        primary_attention_layers),
                                                     *dflash,
                                                     *io.dflash_decode,
                                                     *dflash_host_ingress,
@@ -2215,6 +2381,12 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     }
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
+    if (secondary_persistent_storage) {
+        out.secondary_sequence =
+            ArenaMemorySummary{secondary_persistent_storage->capacity(),
+                               secondary_persistent_storage->used(),
+                               secondary_persistent_storage->peak_used()};
+    }
     out.workspace = ArenaMemorySummary{workspace_storage.capacity(), work.used(), work.peak_used()};
     if (secondary_workspace_storage) {
         out.secondary_workspace = ArenaMemorySummary{secondary_workspace_storage->capacity(),
@@ -2225,6 +2397,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    out.secondary_kv_payload_bytes   = secondary_kv_payload_bytes;
     return out;
 }
 
@@ -2234,6 +2407,7 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
         model.secondary_weights_arena->reset_peak();
     }
     persistent.reset_peak();
+    if (secondary_persistent_storage) { secondary_persistent_storage->reset_peak(); }
     work.reset_peak();
     if (secondary_work) { secondary_work->reset_peak(); }
     workspace_logical_peak_bytes = 0;

@@ -14,7 +14,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,
                             const Tensor* next_embedding) {
-    if (!state.mtp_kv.valid() || !state.execution.io.mtp) {
+    if ((!state.mtp_kv.valid() && !state.secondary_mtp_kv.valid()) || !state.execution.io.mtp) {
         throw std::logic_error("MTP bridge requires MTP storage");
     }
     if (rope_position.size() != 3) {
@@ -25,7 +25,9 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     state.execution.secondary_work);
+                     state.execution.secondary_work, state.secondary_text_kv,
+                     state.secondary_mtp_kv, state.secondary_text_cache,
+                     state.secondary_mtp_cache, state.primary_attention_layers);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.turn_checkpoint_state_slot, state.mtp_proposal_extent);
 
@@ -85,7 +87,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache, &state.mtp_cache, state.execution.secondary_work);
+                         &state.text_cache, state.mtp_cache, state.execution.secondary_work, {}, {},
+                         state.secondary_text_cache, state.secondary_mtp_cache,
+                         state.primary_attention_layers);
         Tensor anchors           = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers         = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets           = frame.remaining_budgets.slice(0, 0, batch_size);

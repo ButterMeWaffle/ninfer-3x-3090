@@ -136,8 +136,9 @@ access. It is mutually exclusive with `--device`; see the
 [Linux NVLink guide](rtx-3090-linux.md#dual-3090-nvlink) before choosing indices on a mixed-GPU
 system. The main-model Q4/Q5 MLP weights are physically split 8,192/9,216 across the two devices.
 Prefill, decode, and MTP verification all execute the two MLP shards and reduce the secondary partial over
-the peer link. Attention, KV state, and the output path remain primary-owned. Cross-device CUDA
-Graph capture is disabled.
+the peer link. Attention projections and the output path remain primary-owned. Paged KV is split by
+full-attention layer, with five layers on the primary and eleven plus optional MTP KV on the
+secondary. Cross-device CUDA Graph capture is disabled.
 
 | Option | Meaning | Default |
 |---|---|---:|

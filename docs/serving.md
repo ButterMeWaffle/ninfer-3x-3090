@@ -463,9 +463,11 @@ Run `./build/apps/ninfer-serve --help` for the exact option contract.
 `--devices PRIMARY,SECONDARY` requires two same-compute-capability devices with bidirectional peer
 access and is mutually exclusive with `--device`. For the dense 27B groupwise target, the server
 physically splits the main-model Q4/Q5 MLP weights 8,192/9,216 across the GPUs. Prefill, decode,
-and MTP verification execute both shards and reduce the secondary partial over the peer link.
-Attention and KV state remain primary-owned. Multi-device CUDA Graph capture is disabled; startup
-performs an eager warm round instead. See the
+and MTP verification execute both shards and reduce the secondary partial over the peer link. The
+text KV cache is split by full-attention layer: five layers stay on the primary, eleven stay on the
+secondary, and MTP KV is secondary-local. Requests reserve matching logical page counts in both
+pools, and automatic capacity must fit both device curves. Multi-device CUDA Graph capture is
+disabled; startup performs an eager warm round instead. See the
 [Linux NVLink guide](rtx-3090-linux.md#dual-3090-nvlink) for mixed-GPU CUDA index discovery.
 
 ## Structured request log

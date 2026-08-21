@@ -59,6 +59,7 @@ public:
     [[nodiscard]] std::uint32_t kv_capacity() const noexcept;
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
+    [[nodiscard]] std::size_t secondary_device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t request_transient_capacity_bytes() const noexcept;
 

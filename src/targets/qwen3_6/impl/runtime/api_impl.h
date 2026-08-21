@@ -49,6 +49,11 @@ std::size_t SequencePlan<Variant>::device_reservation_bytes() const noexcept {
 }
 
 template <>
+std::size_t SequencePlan<Variant>::secondary_device_reservation_bytes() const noexcept {
+    return impl_ != nullptr ? impl_->secondary_device_reservation_bytes : 0;
+}
+
+template <>
 std::size_t SequencePlan<Variant>::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }

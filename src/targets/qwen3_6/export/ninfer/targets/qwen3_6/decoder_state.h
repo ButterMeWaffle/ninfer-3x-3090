@@ -45,6 +45,13 @@ struct PagedKVCacheLayout {
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pool.payload_bytes(); }
 };
 
+[[nodiscard]] PagedKVCacheLayout
+plan_paged_kv_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
+                    std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
+                    std::int32_t quant_group, std::int32_t table_rows,
+                    std::uint32_t physical_page_groups, bool packed_v, bool rotate_k,
+                    bool rotate_v);
+
 class PagedKVCache;
 
 class PagedKVCacheView {

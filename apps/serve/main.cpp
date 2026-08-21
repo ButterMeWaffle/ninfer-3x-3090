@@ -94,6 +94,13 @@ int main(int argc, char** argv) {
                  << " free-after-startup=" << format_bytes(memory.available_after_startup_bytes)
                  << " headroom=" << format_bytes(memory.kv_capacity_headroom_bytes)
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
+                 << " secondary-runtime="
+                 << format_bytes(memory.secondary_runtime_reservation_bytes)
+                 << " secondary-free-after-weights="
+                 << format_bytes(memory.secondary_available_after_weights_bytes)
+                 << " secondary-free-after-startup="
+                 << format_bytes(memory.secondary_available_after_startup_bytes)
+                 << " secondary-slack=" << format_bytes(memory.secondary_planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
                  << format_bytes(memory.cuda_graph_allowance_bytes);
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());

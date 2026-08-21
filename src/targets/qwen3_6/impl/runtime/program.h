@@ -112,6 +112,7 @@ struct TurnCheckpoint {
 struct SequenceKVBundle {
     PagedKVAllocation text;
     std::optional<PagedKVAllocation> backend;
+    std::optional<PagedKVAllocation> secondary_text;
 };
 
 struct DecodeGraphProfile {
@@ -243,6 +244,8 @@ public:
     const bool vision_enabled;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
+    const std::size_t secondary_kv_payload_bytes;
+    const std::uint32_t primary_attention_layers;
     const std::size_t graph_allowance_bytes;
     std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
@@ -252,6 +255,9 @@ public:
     WorkspaceArena work;
     std::optional<DeviceArena> secondary_workspace_storage;
     std::optional<WorkspaceArena> secondary_work;
+    std::optional<DeviceArena> secondary_persistent_storage;
+    std::unique_ptr<qwen3_6::PagedKVCache> secondary_text_kv;
+    std::unique_ptr<qwen3_6::PagedKVCache> secondary_mtp_kv;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
@@ -323,9 +329,14 @@ private:
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
     [[nodiscard]] qwen3_6::PagedKVCache* backend_kv_cache() noexcept;
     [[nodiscard]] const qwen3_6::PagedKVCache* backend_kv_cache() const noexcept;
+    [[nodiscard]] bool backend_kv_on_secondary() const noexcept;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+    [[nodiscard]] qwen3_6::PagedKVCacheView
+    secondary_text_kv_view(const SequenceState& sequence) const;
+    [[nodiscard]] qwen3_6::PagedKVCacheView
+    secondary_mtp_kv_view(const SequenceState& sequence) const;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

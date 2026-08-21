@@ -6,9 +6,11 @@ graph-mode CMake option. Graph mode is selected at runtime with `--devices CUDA_
 
 The current graph path supports dense Qwen3.6/Qwen3.8 27B groupwise `.ninfer` artifacts. It
 physically shards every main-model MLP's packed Q4 gate/up and Q5 down weights between the two
-3090s, executes both shards concurrently, and reduces the secondary result over NVLink. The split
-is used for prompt prefill, ordinary decode, and MTP verification. The 35B-A3B and 27B NVFP4
-targets are not supported by this path.
+3090s, executes both shards concurrently, and reduces the secondary result over NVLink. It also
+shards the growing paged KV cache by attention layer: the primary owns the first five
+full-attention layers, while the secondary owns the remaining eleven and the optional MTP KV
+layer. The split is used for prompt prefill, ordinary decode, and MTP verification. The 35B-A3B
+and 27B NVFP4 targets are not supported by this path.
 
 ## Requirements
 
@@ -135,8 +137,9 @@ machine; do not copy these numbers blindly. NInfer checks that both selected dev
 compute capability and bidirectional peer access. Selecting the 4070 and a 3090 is rejected before
 the model is loaded.
 
-The order matters: the first device is primary and owns attention, KV state, and the final
-reduction; the second device runs the secondary MLP shard.
+The order matters: the first device is primary and owns model execution, the first five text KV
+layers, persistent linear-attention state, and the final MLP reduction. The second device runs the
+secondary MLP shard and owns the remaining eleven text KV layers plus MTP KV when enabled.
 
 ## 6. Run a graph-mode smoke test
 
@@ -177,15 +180,22 @@ and the remaining 9,216 channels on the secondary:
 | packed Q4 gate/up | `[16384,5120]` | `[18432,5120]` |
 | packed Q5 down | `[5120,8192]` | `[5120,9216]` |
 
-Attention, embeddings, normalization, output-head, and optional proposal weights remain on the
-primary because those operators are not graph-split. There is no full model replica on the
-secondary. At each split MLP, NInfer sends the normalized hidden activation to the secondary and
-returns one hidden-size partial result; the primary adds both partials to the residual.
+Attention projections, embeddings, normalization, output-head, and optional proposal weights
+remain on the primary. There is no full model replica on the secondary. At each split MLP, NInfer
+sends the normalized hidden activation to the secondary and returns one hidden-size partial result;
+the primary adds both partials to the residual.
 
-The final weight footprint is therefore asymmetric. The CLI reports `gpu weights used` for the
-primary and `secondary weights used` separately. This is not a transparent 48 GB CUDA allocation:
-the KV pool and persistent sequence state remain primary-owned, while the secondary owns its MLP
-weights and a graph workspace.
+The paged KV cache is a logical shared token budget backed by two device-local physical pools.
+Attention layers 0-4 read and append the primary pool directly. Layers 5-15 copy their Q/K/V and
+small block-table selectors over NVLink, execute GQA against the secondary-local cache, and copy
+the attention result back. Keeping complete layers together preserves the qualified
+24-query-head/4-KV-head kernels and avoids a head-sliced reduction. Every admitted request reserves
+the same logical number of pages in both pools, so concurrent lanes cannot overbook either card.
+
+The final weight footprint is therefore asymmetric. The CLI reports primary and secondary weights,
+sequence arenas, workspaces, KV payload, reservations, and remaining slack separately. This is not
+a transparent 48 GB CUDA allocation: each cache page stays local to the card that owns its layers,
+but admission exposes their combined capacity as one aggregate resident-token entitlement.
 
 Materialization deliberately reads the artifact from storage only once, but it has a temporary
 startup peak:
@@ -211,13 +221,22 @@ one request without waiting for eight. Example:
 ```
 
 This improves aggregate throughput when multiple requests are ready together; it does not launch
-one independent model replica per card. KV capacity is still limited by free memory on the primary
-3090, so size `--kv-capacity` for the combined resident contexts. `--kv-capacity auto` is the
-easiest way to use the primary's remaining memory while retaining the configured headroom.
+one independent model replica per card. Size `--kv-capacity` for the combined resident contexts.
+`--kv-capacity auto` solves both device reservation curves and selects the largest page count that
+fits both cards while retaining the configured headroom on each.
+
+On the development system, ordinary INT8 KV with `--max-context 262144`,
+`--max-concurrency 8`, and the default 1 GiB automatic headroom resolved to **803,328 aggregate
+resident tokens**. Startup reserved 10.30 GiB on the primary and 17.47 GiB on the secondary,
+leaving 1.91 GiB and 1.00 GiB free respectively. This pool can hold roughly three full 262K
+contexts at once, or more shorter contexts whose combined page entitlements fit 803,328 tokens.
+It does not grant 803K context to each request.
 
 ## Measured results on the development system
 
-The implementation was qualified on the device mapping shown above with the Qwen3.8 27B
+The MLP throughput measurements below were collected before KV-by-layer sharding was added. They
+remain useful as the graph-split baseline, but are not a post-sharding benchmark. The current
+implementation was functionally qualified on the device mapping shown above with the Qwen3.8 27B
 groupwise-int artifact, INT8 KV cache, greedy decoding, and CUDA runtime 13.1. These numbers are a
 reference for this particular machine, not a performance guarantee.
 
@@ -229,6 +248,11 @@ The exact-count product benchmark used three measured repetitions after one warm
 | 2,048-token prefill | 997.66 tok/s | 1,407.94 tok/s | +41.1% |
 | 256-token decode | 38.85 tok/s | 45.63 tok/s | +17.5% |
 | 2,048 prefill + 256 decode | 986.95 / 38.30 tok/s | 1,393.78 / 45.31 tok/s | +41.2% / +18.3% |
+
+A post-sharding one-repetition smoke benchmark, after one warmup, measured 512-token prefill at
+974.37 tok/s on one 3090 and 1,377.97 tok/s on two (**+41.4%**). A 64-token ordinary decode
+measured 38.82 tok/s on one and 44.85 tok/s on two (**+15.5%**). Use the command below with at
+least three repetitions for publication-quality local results.
 
 Run that matrix locally with:
 
@@ -253,13 +277,18 @@ disabled prefix reuse, and reserved 2,048 KV tokens per resident request:
 
 At concurrency 8, graph mode delivered 3.20 times its single-request exact-count decode rate. The
 latency of an individual busy-batch request rises because all lanes share the model execution, but
-the measured aggregate rate did not collapse. The primary still owned KV state; its reported free
-memory after startup fell from 11.33 GiB at concurrency 2 to 9.21 GiB at concurrency 8.
+the measured aggregate rate did not collapse. Those measurements used the earlier primary-only KV
+layout; use the automatic-capacity result above for the current sharded memory behavior.
 
 A deterministic ordinary-decode smoke test generated identical 35-token text in single- and
 dual-card modes. The same check with MTP window 3 and the optimized proposal head also generated
 identical text and identical acceptance statistics; its measured prompt decode speed was 63.03
 tok/s on one card and 68.15 tok/s on two.
+
+Post-sharding smoke validation used the real Qwen3.8 artifact for ordinary decode and MTP3, then
+issued four simultaneous HTTP requests through four independently bound KV rows. All four returned
+the requested deterministic text. The 803,328-token automatic-capacity server also warmed and shut
+down cleanly with retained request state.
 
 ## 7. Start the HTTP server
 

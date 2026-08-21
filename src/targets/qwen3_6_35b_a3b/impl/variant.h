@@ -34,6 +34,7 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr bool supports_graph_parallel              = false;
+    static constexpr std::uint32_t graph_primary_attention_layers = 0;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>

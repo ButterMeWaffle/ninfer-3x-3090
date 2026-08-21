@@ -158,7 +158,12 @@ public:
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
-                WorkspaceArena* secondary_work             = nullptr);
+                WorkspaceArena* secondary_work             = nullptr,
+                qwen3_6::PagedKVCacheView secondary_kv     = qwen3_6::PagedKVCacheView(),
+                qwen3_6::PagedKVCacheView secondary_mtp_kv = qwen3_6::PagedKVCacheView(),
+                const qwen3_6::PagedKVCache* batch_secondary_text_kv = nullptr,
+                const qwen3_6::PagedKVCache* batch_secondary_mtp_kv  = nullptr,
+                std::int32_t primary_attention_layers = TextConfig::full_attention_layers());
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -235,8 +240,20 @@ private:
     void bind();
 
     [[nodiscard]] bool mtp_enabled() const noexcept {
-        return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
+        return mtp_kv_.valid() || secondary_mtp_kv_.valid() || batch_mtp_kv_ != nullptr ||
+               batch_secondary_mtp_kv_ != nullptr;
     }
+
+    void remote_gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              const Tensor& positions, const Tensor& valid_columns,
+                              const Tensor& kv_table_rows,
+                              PagedKVBatchLayerView cache,
+                              ops::GqaExecutionEnvelope envelope, Tensor& output);
+    void remote_gqa_attention_cached(const Tensor& q, const Tensor& positions,
+                                     PagedKVLayerView cache,
+                                     ops::GqaExecutionEnvelope envelope, Tensor& output);
+    void remote_gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
+                              PagedKVLayerView cache);
 
     [[nodiscard]] const MtpW& mtp_weights() const;
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
@@ -289,8 +306,13 @@ private:
     WorkspaceArena* secondary_work_ = nullptr;
     qwen3_6::PagedKVCacheView kv_;
     qwen3_6::PagedKVCacheView mtp_kv_;
+    qwen3_6::PagedKVCacheView secondary_kv_;
+    qwen3_6::PagedKVCacheView secondary_mtp_kv_;
     const qwen3_6::PagedKVCache* batch_text_kv_ = nullptr;
     const qwen3_6::PagedKVCache* batch_mtp_kv_  = nullptr;
+    const qwen3_6::PagedKVCache* batch_secondary_text_kv_ = nullptr;
+    const qwen3_6::PagedKVCache* batch_secondary_mtp_kv_  = nullptr;
+    std::int32_t primary_attention_layers_ = TextConfig::full_attention_layers();
     LinearAttentionStatePool& state_;
     qwen3_6::RoundState& io_;
     Tensor& prefill_hidden_;

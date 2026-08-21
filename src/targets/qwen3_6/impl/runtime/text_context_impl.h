@@ -224,14 +224,31 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          qwen3_6::PagedKVCacheView mtp_kv,
                          const qwen3_6::PagedKVCache* batch_text_kv,
                          const qwen3_6::PagedKVCache* batch_mtp_kv,
-                         WorkspaceArena* secondary_work)
+                         WorkspaceArena* secondary_work,
+                         qwen3_6::PagedKVCacheView secondary_kv,
+                         qwen3_6::PagedKVCacheView secondary_mtp_kv,
+                         const qwen3_6::PagedKVCache* batch_secondary_text_kv,
+                         const qwen3_6::PagedKVCache* batch_secondary_mtp_kv,
+                         std::int32_t primary_attention_layers)
     : ctx_(ctx), weights_(weights), work_(work), secondary_work_(secondary_work), kv_(kv),
-      mtp_kv_(mtp_kv), batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv), state_(state),
-      io_(io), prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk),
-      text_kv_base_(text_kv_base) {
+      mtp_kv_(mtp_kv), secondary_kv_(secondary_kv), secondary_mtp_kv_(secondary_mtp_kv),
+      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv),
+      batch_secondary_text_kv_(batch_secondary_text_kv),
+      batch_secondary_mtp_kv_(batch_secondary_mtp_kv),
+      primary_attention_layers_(primary_attention_layers), state_(state), io_(io),
+      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
+    }
+    if (primary_attention_layers_ < 0 ||
+        primary_attention_layers_ > TextConfig::full_attention_layers()) {
+        throw std::invalid_argument("TextContext primary attention layer split is invalid");
+    }
+    if (primary_attention_layers_ != TextConfig::full_attention_layers() &&
+        (!ctx_.model_parallel() || secondary_work_ == nullptr ||
+         batch_secondary_text_kv_ == nullptr)) {
+        throw std::invalid_argument("TextContext sharded attention binding is incomplete");
     }
     if (mtp_enabled() && !io_.mtp_decode && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
@@ -241,6 +258,132 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
 }
 
 TextContext::~TextContext() = default;
+
+void TextContext::remote_gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                       const Tensor& positions, const Tensor& valid_columns,
+                                       const Tensor& kv_table_rows, PagedKVBatchLayerView cache,
+                                       ops::GqaExecutionEnvelope envelope, Tensor& output) {
+    if (secondary_work_ == nullptr || !ctx_.model_parallel() || ctx_.active_rank() != 0) {
+        throw std::logic_error("remote GQA requires primary-rank graph-parallel execution");
+    }
+    auto scope = secondary_work_->scope();
+    const auto allocate_like = [&](const Tensor& source) {
+        return secondary_work_->alloc(
+            source.dtype, {source.ne[0], source.ne[1], source.ne[2], source.ne[3]});
+    };
+    Tensor remote_q         = allocate_like(q);
+    Tensor remote_k         = allocate_like(k);
+    Tensor remote_v         = allocate_like(v);
+    Tensor remote_positions = allocate_like(positions);
+    Tensor remote_rows      = allocate_like(kv_table_rows);
+    Tensor remote_valid;
+    if (valid_columns.data != nullptr) { remote_valid = allocate_like(valid_columns); }
+    Tensor remote_output = allocate_like(output);
+
+    const int primary_device   = ctx_.device_ids()[0];
+    const int secondary_device = ctx_.device_ids()[1];
+    cudaStream_t primary_stream = ctx_.stream_for_rank(0);
+    cudaEvent_t primary_ready   = ctx_.fence_for_rank(0);
+    cudaEvent_t secondary_ready = ctx_.fence_for_rank(1);
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    {
+        ScopedDeviceRank secondary(ctx_, 1);
+        cudaStream_t stream = ctx_.stream;
+        CUDA_CHECK(cudaStreamWaitEvent(stream, primary_ready, 0));
+        const auto copy = [&](Tensor& destination, const Tensor& source) {
+            CUDA_CHECK(cudaMemcpyPeerAsync(destination.data, secondary_device, source.data,
+                                           primary_device, source.bytes(), stream));
+        };
+        copy(remote_q, q);
+        copy(remote_k, k);
+        copy(remote_v, v);
+        copy(remote_positions, positions);
+        copy(remote_rows, kv_table_rows);
+        if (remote_valid.data != nullptr) { copy(remote_valid, valid_columns); }
+        ops::gqa_attention(remote_q, remote_k, remote_v, remote_positions, remote_valid,
+                           remote_rows, kAttnScale, cache, envelope, *secondary_work_,
+                           remote_output, stream);
+        CUDA_CHECK(cudaEventRecord(secondary_ready, stream));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+    CUDA_CHECK(cudaMemcpyPeerAsync(output.data, primary_device, remote_output.data,
+                                   secondary_device, output.bytes(), primary_stream));
+}
+
+void TextContext::remote_gqa_attention_cached(const Tensor& q, const Tensor& positions,
+                                              PagedKVLayerView cache,
+                                              ops::GqaExecutionEnvelope envelope,
+                                              Tensor& output) {
+    if (secondary_work_ == nullptr || !ctx_.model_parallel() || ctx_.active_rank() != 0) {
+        throw std::logic_error("remote cached GQA requires primary-rank graph execution");
+    }
+    auto scope = secondary_work_->scope();
+    Tensor remote_q = secondary_work_->alloc(
+        q.dtype, {q.ne[0], q.ne[1], q.ne[2], q.ne[3]});
+    Tensor remote_positions = secondary_work_->alloc(
+        positions.dtype,
+        {positions.ne[0], positions.ne[1], positions.ne[2], positions.ne[3]});
+    Tensor remote_output = secondary_work_->alloc(
+        output.dtype, {output.ne[0], output.ne[1], output.ne[2], output.ne[3]});
+
+    const int primary_device    = ctx_.device_ids()[0];
+    const int secondary_device  = ctx_.device_ids()[1];
+    cudaStream_t primary_stream = ctx_.stream_for_rank(0);
+    cudaEvent_t primary_ready   = ctx_.fence_for_rank(0);
+    cudaEvent_t secondary_ready = ctx_.fence_for_rank(1);
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    {
+        ScopedDeviceRank secondary(ctx_, 1);
+        cudaStream_t stream = ctx_.stream;
+        CUDA_CHECK(cudaStreamWaitEvent(stream, primary_ready, 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_q.data, secondary_device, q.data, primary_device,
+                                       q.bytes(), stream));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_positions.data, secondary_device, positions.data,
+                                       primary_device, positions.bytes(), stream));
+        ops::gqa_attention_cached(remote_q, remote_positions, kAttnScale, cache, envelope,
+                                  *secondary_work_, remote_output, stream);
+        CUDA_CHECK(cudaEventRecord(secondary_ready, stream));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+    CUDA_CHECK(cudaMemcpyPeerAsync(output.data, primary_device, remote_output.data,
+                                   secondary_device, output.bytes(), primary_stream));
+}
+
+void TextContext::remote_gqa_kv_append(const Tensor& k, const Tensor& v,
+                                       const Tensor& positions, PagedKVLayerView cache) {
+    if (secondary_work_ == nullptr || !ctx_.model_parallel() || ctx_.active_rank() != 0) {
+        throw std::logic_error("remote GQA append requires primary-rank graph execution");
+    }
+    auto scope = secondary_work_->scope();
+    Tensor remote_k =
+        secondary_work_->alloc(k.dtype, {k.ne[0], k.ne[1], k.ne[2], k.ne[3]});
+    Tensor remote_v =
+        secondary_work_->alloc(v.dtype, {v.ne[0], v.ne[1], v.ne[2], v.ne[3]});
+    Tensor remote_positions = secondary_work_->alloc(
+        positions.dtype,
+        {positions.ne[0], positions.ne[1], positions.ne[2], positions.ne[3]});
+
+    const int primary_device    = ctx_.device_ids()[0];
+    const int secondary_device  = ctx_.device_ids()[1];
+    cudaStream_t primary_stream = ctx_.stream_for_rank(0);
+    cudaEvent_t primary_ready   = ctx_.fence_for_rank(0);
+    cudaEvent_t secondary_ready = ctx_.fence_for_rank(1);
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    {
+        ScopedDeviceRank secondary(ctx_, 1);
+        cudaStream_t stream = ctx_.stream;
+        CUDA_CHECK(cudaStreamWaitEvent(stream, primary_ready, 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_k.data, secondary_device, k.data, primary_device,
+                                       k.bytes(), stream));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_v.data, secondary_device, v.data, primary_device,
+                                       v.bytes(), stream));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_positions.data, secondary_device, positions.data,
+                                       primary_device, positions.bytes(), stream));
+        ops::gqa_kv_append(remote_k, remote_v, remote_positions, cache, stream);
+        CUDA_CHECK(cudaEventRecord(secondary_ready, stream));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+}
 
 void TextContext::set_linear_state_slots(std::int32_t current_slot,
                                          std::int32_t turn_checkpoint_slot) {
@@ -387,6 +530,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
+    const bool remote_cache = batch_secondary_mtp_kv_ != nullptr;
+    const auto* cache       = remote_cache ? batch_secondary_mtp_kv_ : batch_mtp_kv_;
+    if (cache == nullptr) { throw std::logic_error("MTP attention KV cache is unavailable"); }
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T ||
@@ -398,12 +544,23 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
-        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
-                           *active_backend_kv_table_rows_, kAttnScale,
-                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+        if (remote_cache) {
+            remote_gqa_attention(q_batch, k_batch, v_batch, position_batch,
+                                 *active_valid_columns_, *active_backend_kv_table_rows_,
+                                 cache->batch_layer_view(0), envelope, a_batch);
+        } else {
+            ops::gqa_attention(q_batch, k_batch, v_batch, position_batch,
+                               *active_valid_columns_, *active_backend_kv_table_rows_, kAttnScale,
+                               cache->batch_layer_view(0), envelope, work_, a_batch, s);
+        }
     } else {
-        ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, kAttnScale,
-                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+        if (remote_cache) {
+            remote_gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
+                                 cache->batch_layer_view(0), envelope, a);
+        } else {
+            ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
+                               kAttnScale, cache->batch_layer_view(0), envelope, work_, a, s);
+        }
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -427,7 +584,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                                    const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                                    Tensor& mtp_hidden, const Tensor* input_embeddings) {
-    if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr) {
+        throw std::runtime_error("MTP forward is not enabled");
+    }
     auto scratch_scope = work_.scope();
     Tensor x;
     Tensor ah;
@@ -440,7 +599,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& rope_positions,
                                     ops::GqaExecutionEnvelope envelope, bool final_chunk,
                                     Tensor* final_hidden, Tensor* logits, Tensor* draft_token) {
-    if (!mtp_kv_.valid()) { throw std::runtime_error("MTP prefill is not enabled"); }
+    if (!mtp_kv_.valid() && !secondary_mtp_kv_.valid()) {
+        throw std::runtime_error("MTP prefill is not enabled");
+    }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
         throw std::invalid_argument("MTP prefill chunk T must be in [1,prefill_chunk]");
@@ -489,7 +650,11 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
-        ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+        if (secondary_mtp_kv_.valid()) {
+            remote_gqa_kv_append(kn, v, positions, secondary_mtp_kv_.layer_view(0));
+        } else {
+            ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+        }
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -531,8 +696,13 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
-                                  work_, a, s);
+        if (secondary_mtp_kv_.valid()) {
+            remote_gqa_attention_cached(qn, last_position, secondary_mtp_kv_.layer_view(0),
+                                        envelope, a);
+        } else {
+            ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0),
+                                      envelope, work_, a, s);
+        }
         ops::sigmoid_mul(gate, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
@@ -573,7 +743,9 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     Tensor& mtp_hidden, int logits_column, Tensor* logits,
                                     Tensor* draft_token, const Tensor* explicit_rope_positions,
                                     const Tensor* input_embeddings) {
-    if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr) {
+        throw std::runtime_error("MTP forward is not enabled");
+    }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
         throw std::invalid_argument("MTP batch T must be in [1,prefill_chunk]");
@@ -617,7 +789,9 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
 void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                                       const Tensor& position, ops::GqaExecutionEnvelope envelope,
                                       Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token) {
-    if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr) {
+        throw std::runtime_error("MTP forward is not enabled");
+    }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(position, DType::I32, {1}, "MTP AR position");
     require_tensor_shape(previous_hidden, DType::BF16, {kCfg.hidden, 1}, "MTP AR previous hidden");
@@ -757,7 +931,9 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden) {
-    if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr) {
+        throw std::runtime_error("MTP forward is not enabled");
+    }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) || batch <= 0 ||
@@ -828,6 +1004,11 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    const bool remote_layer = fidx >= primary_attention_layers_;
+    const auto* cache       = remote_layer ? batch_secondary_text_kv_ : batch_text_kv_;
+    if (cache == nullptr) { throw std::logic_error("Text attention KV cache is unavailable"); }
+    const std::uint32_t cache_layer = static_cast<std::uint32_t>(
+        remote_layer ? fidx - primary_attention_layers_ : fidx);
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -839,13 +1020,24 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                           kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                           *active_gqa_envelope_, work_, a_batch, s);
+        if (remote_layer) {
+            remote_gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+                                 cache->batch_layer_view(cache_layer), *active_gqa_envelope_,
+                                 a_batch);
+        } else {
+            ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+                               kAttnScale, cache->batch_layer_view(cache_layer),
+                               *active_gqa_envelope_, work_, a_batch, s);
+        }
     } else {
-        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
-                           batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_,
-                           work_, a, s);
+        if (remote_layer) {
+            remote_gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+                                 cache->batch_layer_view(cache_layer), *active_gqa_envelope_, a);
+        } else {
+            ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
+                               cache->batch_layer_view(cache_layer), *active_gqa_envelope_, work_,
+                               a, s);
+        }
     }
     ops::sigmoid_mul(gate, a, s);
 

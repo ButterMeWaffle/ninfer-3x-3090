@@ -1,34 +1,38 @@
-# NInfer-3090
+# NInfer Dual RTX 3090 NVLink
 
-NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on one
-24 GB NVIDIA GeForce RTX 3090, with an optional dual-3090 NVLink graph-parallel route. Qwen3.8-27B
-is a first-class, tested target: the native SM86 runtime loads its official groupwise `.ninfer`
+This fork extends NInfer-3090 with a native Linux graph-parallel route for **two RTX 3090s joined by
+NVLink**. Dense Qwen3.8-27B and Qwen3.6-27B groupwise models physically split their packed MLP
+weights across both cards, execute both shards concurrently, and reduce the secondary result over
+NVLink. Enable it at runtime with `--devices PRIMARY,SECONDARY`; the same `sm_86` build continues to
+support ordinary single-card execution with `--device PRIMARY`.
+
+Qwen3.8-27B is the primary qualified dual-GPU target. The engine loads its native `.ninfer`
 artifact, serves OpenAI- and Anthropic-compatible APIs, and supports paged KV, compatible-prefix
-reuse, CUDA Graphs, MTP speculative decoding, reasoning-effort control, ReplaySSM state
-transactions, and concurrent cohorts through **C8**.
+reuse, MTP speculative decoding, reasoning-effort control, ReplaySSM state transactions, and
+concurrent cohorts through **C8**. Cross-device execution uses an eager graph schedule because CUDA
+Graph capture is disabled for the multi-device round; single-card execution retains CUDA Graphs.
 
 Community project, maintained on a best-effort basis. Issues and PRs are very welcome, but support
 and feature requests are not guaranteed.
 
-
-
-On an RTX 3090, Qwen3.8-27B supports a measured **171K-token INT8 context** with the standard
+On one RTX 3090, Qwen3.8-27B supports a measured **171K-token INT8 context** with the standard
 1 GiB safety headroom. The optional RotorQuant `rk8v4` cache raises this to **226K tokens with
 1 GiB headroom**, or **247,872 tokens (about 248K)** in a tightly packed 300 MiB-headroom profile.
 RotorQuant is an opt-in feature; INT8 remains the default because `rk8v4` is lossy.
 
-This fork targets `sm_86`. Blackwell-only NVFP4/W4A4 execution is unavailable. 
+This fork targets `sm_86`. Blackwell-only NVFP4/W4A4 execution is unavailable.
 
-The goal is the make the utmost rippin Qwen inference stack for the 3000 series. Gladly taking PR's, all help much appreciated. 
+The goal is to make the fastest practical Qwen inference stack for dual RTX 3090 systems. PRs and
+testing on other two-card NVLink configurations are welcome.
 
-Release notes for this branch: [v0.6.1](RELEASE_NOTES_0.6.1.md).
+Base NInfer-3090 release notes: [v0.6.1](RELEASE_NOTES_0.6.1.md).
 
 ## Dual RTX 3090 graph parallelism
 
-The dense 27B groupwise targets can split every text-layer MLP across two peer-connected SM86
-devices. Both GPUs run their gate/up and down-projection shards concurrently; the secondary partial
-is reduced into the primary residual over NVLink. Prompt prefill, ordinary decode, and MTP
-verification all use the split.
+The dense 27B groupwise targets split every text-layer MLP across two peer-connected SM86 devices.
+Both GPUs run their gate/up and down-projection shards concurrently; the secondary partial is
+reduced into the primary residual over NVLink. Prompt prefill, ordinary decode, and MTP verification
+all use the split. This is a physical weight split, not two complete model replicas.
 
 ```bash
 ./build-sm86/apps/ninfer models/qwen3_8_27b.ninfer \
@@ -41,11 +45,63 @@ The two listed CUDA devices must have the same compute capability and bidirectio
 CUDA device order can differ from `nvidia-smi` order, especially when an Ada display card is also
 installed; use the probe in the [Linux guide](docs/rtx-3090-linux.md#dual-3090-nvlink) and select
 the two CUDA indices whose PCI bus IDs identify the 3090s. The route physically shards the packed
-main-model Q4/Q5 MLP weights 8,192/9,216; attention, KV state, and unsplit weights stay on the
-primary. CUDA Graph capture is disabled for this cross-device schedule and an eager representative
-round is warmed at startup instead. The 35B-A3B and 27B NVFP4 targets currently reject `--devices`.
+main-model Q4/Q5 MLP weights 8,192/9,216. Attention projections and unsplit weights stay on the
+primary, while paged KV is split by full-attention layer: five layers remain primary-local and
+eleven layers, plus optional MTP KV, live on the secondary. CUDA Graph capture is disabled for this
+cross-device schedule and an eager representative round is warmed at startup instead. The 35B-A3B
+and 27B NVFP4 targets currently reject `--devices`.
 See [GRAPH-MODE-README.md](GRAPH-MODE-README.md) for compile steps, startup memory peaks, and C2-C8
 serving guidance.
+
+To serve concurrent OpenAI/Anthropic-compatible requests across both cards:
+
+```bash
+./build-sm86/apps/ninfer-serve models/qwen3_8_27b.ninfer \
+  --host 127.0.0.1 --port 8080 \
+  --max-context 8192 --kv-capacity auto --kv-dtype int8 \
+  --max-concurrency 8 --max-pending-requests 32 \
+  --devices 1,2
+```
+
+### Measured dual-card results
+
+The graph path was qualified on two RTX 3090s connected by NVLink, with a third RTX 4070 SUPER used
+as the display card. Measurements used the Qwen3.8-27B groupwise-int artifact, INT8 KV, greedy
+decoding, and CUDA runtime 13.1. The exact-count table used three measured repetitions after one
+warmup. These throughput measurements predate KV-by-layer sharding and are retained as the
+MLP-split baseline pending a full post-sharding benchmark rerun.
+
+| Exact-count workload | One RTX 3090 | Dual RTX 3090 | Change |
+|---|---:|---:|---:|
+| 512-token prefill | 975.62 tok/s | **1,378.72 tok/s** | **+41.3%** |
+| 2,048-token prefill | 997.66 tok/s | **1,407.94 tok/s** | **+41.1%** |
+| 256-token decode | 38.85 tok/s | **45.63 tok/s** | **+17.5%** |
+| 2,048 prefill + 256 decode | 986.95 / 38.30 tok/s | **1,393.78 / 45.31 tok/s** | **+41.2% / +18.3%** |
+
+A post-sharding one-repetition smoke benchmark (after one warmup) measured 512-token prefill at
+974.37 tok/s single-card versus 1,377.97 tok/s dual-card (**+41.4%**), and 64-token ordinary decode
+at 38.82 tok/s versus 44.85 tok/s (**+15.5%**). Run a multi-repetition local benchmark before using
+these smoke figures as publication results.
+
+The ordinary dual-card layout held **11.09 GiB** of weights on the primary and **4.83 GiB** on the
+secondary, compared with 15.92 GiB on one card. KV pages remain device-local but form one logical
+aggregate entitlement across both layer pools. With native 262K per-request context, C8, INT8 KV,
+and automatic sizing, the current layout resolved **803,328 aggregate resident tokens** while
+retaining the default 1 GiB headroom on both cards (10.30 GiB primary and 17.47 GiB secondary
+runtime reservations).
+
+Concurrent HTTP requests also scale through the shared graph:
+
+| Concurrency | Single-card aggregate | Dual-card aggregate | Change |
+|---:|---:|---:|---:|
+| C2 | 63.85 tok/s | **64.37 tok/s** | +0.8% |
+| C4 | 102.44 tok/s | **114.82 tok/s** | +12.1% |
+| C8 | 127.05 tok/s | **145.97 tok/s** | +14.9% |
+
+Each concurrency measurement generated exactly 256 tokens per request with prefix reuse disabled.
+At C8, the dual route delivered 3.20 times its single-request exact-count decode rate. Deterministic
+ordinary and MTP3 generation produced identical text and identical MTP acceptance statistics in
+single- and dual-card modes.
 
 ## Choose a platform
 
@@ -63,10 +119,13 @@ docker build --tag ninfer-3090:sm86 .
 ```
 
 The Linux guide contains the GPU check, native Ubuntu build, model mount, server command, and Bash
-launchers. The project does not publish a prebuilt Linux archive or qualified Linux performance
-results yet.
+launchers. Native Linux is the qualified dual-3090 path; this repository does not currently publish
+a prebuilt Linux archive.
 
 ### Windows 11
+
+The inherited Windows release is the base project's single-card distribution. The dual-NVLink
+route in this fork is currently qualified on Linux only.
 
 1. Download and unzip the latest [Windows release](https://github.com/Don-Chad/ninfer-3090/releases/latest).
 2. Double-click `download-qwen38.bat` to download the model. Interrupted downloads resume.
@@ -82,7 +141,7 @@ results yet.
 The API is then available at `http://127.0.0.1:8080/v1`. The Windows archive includes the required
 applications and DLLs.
 
-## Qwen3.8-27B support and RTX 3090 results
+## Qwen3.8-27B single-card results
 
 Qwen3.8-27B is validated from one through eight simultaneous users. ReplaySSM cuts the memory cost
 of speculative decoding, allowing the faster MTP3 mode to remain enabled at C8. The table below is
@@ -167,7 +226,7 @@ A 1,920×1,080 image expanded to 2,074 prompt tokens and was read correctly. Mea
 free VRAM. The artifact also declares multi-image and video support; this release test directly
 validated a single image.
 
-## Qwen3.6-35B-A3B RTX 3090 results
+## Qwen3.6-35B-A3B single-card results
 
 Measured with the compact 20.84 GiB 35B-A3B artifact, a 4K shared INT8 group-64 paged KV pool,
 CUDA Graphs, MTP3, greedy decoding, and no competing GPU workload:
@@ -204,8 +263,9 @@ still use MTP3 as documented above.
 
 ## Capabilities
 
-- Native SM86 CLI and server applications for Linux and Windows.
-- A prebuilt Windows archive with tested launchers.
+- Native dual-RTX-3090 NVLink graph parallelism on Linux for dense 27B groupwise artifacts.
+- Native SM86 CLI and server applications for Linux and Windows single-card use.
+- An inherited prebuilt Windows single-card archive with tested launchers.
 - OpenAI Chat Completions, Responses, and Anthropic-compatible APIs.
 - ReplaySSM and MTP3 for higher throughput without exceeding 24 GB VRAM.
 - `low`, `medium`, and `xhigh` reasoning modes.
@@ -220,8 +280,8 @@ still use MTP3 as documented above.
 |---|---|---:|---|
 | Qwen3.6-35B-A3B v1 | [pinned compact artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c) | 20.84 GiB | **Recommended for RTX 3090; text C1-C6 at 4K and vision C1 at 32K** |
 | Qwen3.6-35B-A3B v2 | [current upstream artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | 21.22 GiB | Reader supported by v0.5+; includes DFlash payload and is not the measured 3090 artifact |
-| Qwen3.6-27B | [groupwise artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | 16.29 GiB | Supported with more runtime headroom |
-| **Qwen3.8-27B** | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB | **Validated at C1, C2, C4 and C8/MTP3 with ReplaySSM** |
+| Qwen3.6-27B | [groupwise artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | 16.29 GiB | Single-card supported; eligible for the dual Q4/Q5 MLP split |
+| **Qwen3.8-27B** | [official NInfer groupwise artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 16.96 GiB | **Qualified on dual 3090s; single-card validated at C1-C8/MTP3** |
 
 NInfer-3090 v0.5 and newer recognize both v1 and v2 container magic. The current 21.22 GiB v2
 artifact contains additional DFlash weights and is not the artifact used for the published RTX
@@ -233,6 +293,10 @@ omits DFlash, providing the known 24 GB memory profile.
 Linux users build the applications from source or use the Docker image. Windows users can use the
 prebuilt archive, which includes the applications and required DLLs. Both platforms require an
 RTX 3090 or RTX 3090 Ti and a recent NVIDIA driver.
+
+Dual graph mode additionally requires two matching SM86 cards, bidirectional CUDA peer access, and
+an NVLink bridge. It is currently qualified on Linux. A third display GPU is supported; discover
+the CUDA ordinals with `tools/multi_gpu_probe.cu` instead of assuming `nvidia-smi` table order.
 
 Download the [official Qwen3.8 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) as
 `models/qwen3_8_27b.ninfer`. Windows users can run `download-qwen38.bat` instead.
@@ -303,7 +367,8 @@ so a C8 server also works normally with only one, two, or four active users.
 
 This is deliberately more bounded than datacenter-style dynamic batching. The maximum number of
 users and GPU memory are chosen when the server starts. In return, memory use stays predictable on
-a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding work continuously.
+a 24 GB card. Single-card execution reuses CUDA Graphs; dual-card execution uses the warmed eager
+cross-device schedule.
 
 ## Current limits
 
@@ -312,6 +377,8 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 - Concurrency is fixed at startup and limited to 1-8 by the API; compact 35B fits C1-C6 and
   Qwen3.8-27B fits C8/8K with MTP3 through ReplaySSM.
 - The shared KV pool is fixed at startup and is not divided statically among request lanes.
+- In dual-27B mode, every lane reserves matching logical page counts in the primary five-layer and
+  secondary eleven-layer KV pools; admission is limited by whichever physical pool fills first.
 - This is bounded small-scale batching, not preemptive large-scale continuous batching.
 - Multi-GPU execution is limited to the dense 27B groupwise Q4/Q5 MLP graph; there is no CPU/GPU
   weight offload, 35B graph split, or NVFP4 graph split.
@@ -326,14 +393,21 @@ The v0.6.0 Windows gate covered Qwen3.8 generation, materialization, request mem
 paged KV, prefix reuse, speculative rounds, and SM86 W8 Linear paths.
 
 The v0.6.1 Linux source gate completed all 245 Docker compile and link steps with CUDA 13.1 on
-Ubuntu 24.04. Both Linux applications returned their `--help` output with GPU access enabled.
-A real-artifact Linux generation and Linux performance qualification remain open.
+Ubuntu 24.04. The dual-GPU extension was then qualified with the real Qwen3.8-27B groupwise-int
+artifact on two NVLinked RTX 3090s. Materialization, device-selection, reduction, attention,
+paged-KV, capacity, Q4/Q5 graph-shard, and benchmark-contract tests passed. Ordinary and MTP3
+sharded-KV generation completed with deterministic requested output, four simultaneous HTTP lanes
+completed correctly, and the 803,328-token automatic pool survived warmup and retained-state
+shutdown. The earlier MLP throughput and C2-C8 serving measurements above predate KV-by-layer
+sharding and are retained as a baseline pending a full post-sharding benchmark rerun.
 
 ## Upstream
 
-NInfer-3090 is derived from [Neroued/ninfer](https://github.com/Neroued/ninfer). The upstream project
-targets RTX 5090/`sm_120a`; this fork carries the Windows and Linux SM86 compatibility layer,
-compact 35B artifact support, and RTX 3090-specific schedules and memory planning.
+This repository is based on [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090), which
+ports [Neroued/ninfer](https://github.com/Neroued/ninfer) from RTX 5090/`sm_120a` to RTX
+3090/`sm_86`. This fork adds compact dual-device materialization, Q4/Q5 MLP shard kernels, NVLink
+activation/result exchange, primary/secondary memory accounting, dual-device CLI/server/benchmark
+selection, concurrency qualification, and mixed-display-GPU discovery.
 
 ## Contributors
 

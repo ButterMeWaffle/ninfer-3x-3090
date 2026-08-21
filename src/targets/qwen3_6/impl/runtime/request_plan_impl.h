@@ -201,10 +201,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
-            decoder->mtp_cache() != nullptr &&
+            backend_kv_cache() != nullptr &&
             (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
         const bool checkpoint_ready = plan->reuse == ReusePath::RestoreTurnCheckpoint &&
-                                      decoder->mtp_cache() != nullptr &&
+                                      backend_kv_cache() != nullptr &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
             plan->reuse      = ReusePath::FullReset;

@@ -51,6 +51,40 @@ int main() {
     failures += check(insufficient_rejected,
                       "automatic KV capacity accepted less than the minimum reservation");
 
+    const ninfer::runtime::SequenceCapacityCurve sharded_curve{
+        .main_page_tokens                                = 64,
+        .minimum_main_page_groups                        = 2,
+        .maximum_main_page_groups                        = 6,
+        .minimum_device_reservation_bytes                = 1000,
+        .bytes_per_additional_main_page_group            = 128,
+        .minimum_secondary_device_reservation_bytes      = 600,
+        .secondary_bytes_per_additional_main_page_group  = 256,
+    };
+    const auto sharded = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(50), sharded_curve, 1360, 1200);
+    failures += check(
+        sharded.main_page_groups == 4 && sharded.resolved_tokens == 256 &&
+            sharded.runtime_reservation_bytes == 1256 &&
+            sharded.secondary_runtime_reservation_bytes == 1112 &&
+            sharded.secondary_available_after_weights_bytes == 1200 &&
+            sharded.secondary_planned_slack_bytes == 88,
+        "sharded automatic KV capacity did not enforce both device curves");
+
+    const auto secondary_limited = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(50), sharded_curve, 1360, 1150);
+    failures += check(secondary_limited.main_page_groups == 3 &&
+                          secondary_limited.runtime_reservation_bytes == 1128 &&
+                          secondary_limited.secondary_runtime_reservation_bytes == 856,
+                      "sharded KV capacity did not honor the limiting secondary pool");
+
+    bool insufficient_secondary_rejected = false;
+    try {
+        (void)ninfer::runtime::resolve_kv_capacity(
+            ninfer::KvCapacityPolicy::explicit_capacity(129), sharded_curve, 1200, 855);
+    } catch (const std::invalid_argument&) { insufficient_secondary_rejected = true; }
+    failures += check(insufficient_secondary_rejected,
+                      "explicit KV capacity accepted an undersized secondary pool");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

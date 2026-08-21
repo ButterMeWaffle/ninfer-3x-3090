@@ -183,6 +183,17 @@ public:
         out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
         out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
         out.planned_slack_bytes                = resolution.planned_slack_bytes;
+        out.secondary_minimum_runtime_reservation_bytes =
+            resolution.secondary_minimum_runtime_reservation_bytes;
+        out.secondary_kv_capacity_increment_bytes =
+            resolution.secondary_bytes_per_additional_main_page_group;
+        out.secondary_runtime_reservation_bytes =
+            resolution.secondary_runtime_reservation_bytes;
+        out.secondary_available_after_weights_bytes =
+            resolution.secondary_available_after_weights_bytes;
+        out.secondary_available_after_startup_bytes =
+            resolution.secondary_available_after_startup_bytes;
+        out.secondary_planned_slack_bytes = resolution.secondary_planned_slack_bytes;
         return out;
     }
 

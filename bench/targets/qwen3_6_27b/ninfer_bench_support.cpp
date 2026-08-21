@@ -583,7 +583,10 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.load.peer_to_peer_bytes) << ", staging peak "
         << format_bytes(env.load.peak_staging_bytes) << '\n'
         << "  memory:     weights " << format_bytes(env.memory.weights.capacity_bytes)
-        << ", sequence " << format_bytes(env.memory.sequence.capacity_bytes) << ", workspace "
+        << ", secondary weights " << format_bytes(env.memory.secondary_weights.capacity_bytes)
+        << ", sequence " << format_bytes(env.memory.sequence.capacity_bytes)
+        << ", secondary sequence "
+        << format_bytes(env.memory.secondary_sequence.capacity_bytes) << ", workspace "
         << format_bytes(env.memory.workspace.capacity_bytes) << ", request transient "
         << format_bytes(env.memory.request_transient.capacity_bytes) << ", graph allowance "
         << format_bytes(env.memory.cuda_graph_allowance_bytes) << ", KV payload "
@@ -678,6 +681,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
     append_arena_json(out, "secondary_weights", env.memory.secondary_weights, "    ", true);
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
+    append_arena_json(out, "secondary_sequence", env.memory.secondary_sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
     append_arena_json(out, "secondary_workspace", env.memory.secondary_workspace, "    ", true);
     append_arena_json(out, "request_transient", env.memory.request_transient, "    ", true);
@@ -692,9 +696,23 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << ",\n"
         << "    \"kv_capacity_headroom_bytes\": " << env.memory.kv_capacity_headroom_bytes << ",\n"
         << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
+        << "    \"secondary_minimum_runtime_reservation_bytes\": "
+        << env.memory.secondary_minimum_runtime_reservation_bytes << ",\n"
+        << "    \"secondary_kv_capacity_increment_bytes\": "
+        << env.memory.secondary_kv_capacity_increment_bytes << ",\n"
+        << "    \"secondary_runtime_reservation_bytes\": "
+        << env.memory.secondary_runtime_reservation_bytes << ",\n"
+        << "    \"secondary_available_after_weights_bytes\": "
+        << env.memory.secondary_available_after_weights_bytes << ",\n"
+        << "    \"secondary_available_after_startup_bytes\": "
+        << env.memory.secondary_available_after_startup_bytes << ",\n"
+        << "    \"secondary_planned_slack_bytes\": "
+        << env.memory.secondary_planned_slack_bytes << ",\n"
         << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
         << "    \"cuda_graph_observed_bytes\": " << env.memory.cuda_graph_observed_bytes << ",\n"
-        << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
+        << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << ",\n"
+        << "    \"secondary_kv_payload_bytes\": "
+        << env.memory.secondary_kv_payload_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"

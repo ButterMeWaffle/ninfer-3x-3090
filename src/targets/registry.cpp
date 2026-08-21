@@ -81,7 +81,12 @@ void require_load_capacity(const DeviceContext& device, std::size_t rank,
     }
 }
 
-std::size_t runtime_bytes_after_planned_weights(
+struct RuntimeAvailability {
+    std::size_t primary   = 0;
+    std::size_t secondary = 0;
+};
+
+RuntimeAvailability runtime_bytes_after_planned_weights(
     const artifact::MaterializationPlan& plan, DeviceContext& device) {
     const std::uint64_t primary_final = plan.device_capacity_bytes;
     const std::uint64_t primary_source = plan.source_device_capacity_bytes == 0
@@ -91,6 +96,8 @@ std::size_t runtime_bytes_after_planned_weights(
     const std::size_t primary_free   = free_device_bytes(device, 0);
     require_load_capacity(device, 0, primary_peak, primary_free);
 
+    RuntimeAvailability available{.primary =
+                                      primary_free - static_cast<std::size_t>(primary_final)};
     if (device.model_parallel()) {
         std::uint64_t secondary_peak = primary_source;
         if (!plan.row_split_shards.empty()) {
@@ -103,16 +110,11 @@ std::size_t runtime_bytes_after_planned_weights(
         }
         const std::size_t secondary_free = free_device_bytes(device, 1);
         require_load_capacity(device, 1, secondary_peak, secondary_free);
+        available.secondary =
+            secondary_free - static_cast<std::size_t>(plan.secondary_device_capacity_bytes);
     }
 
-    return primary_free - static_cast<std::size_t>(primary_final);
-}
-
-std::size_t current_free_device_bytes() {
-    std::size_t free_bytes  = 0;
-    std::size_t total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    return free_bytes;
+    return available;
 }
 
 template <class Target, class Loaded, class Instance>
@@ -127,9 +129,10 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
-    const std::size_t preflight_runtime_bytes =
+    const RuntimeAvailability preflight_runtime =
         runtime_bytes_after_planned_weights(load_plan.materialization(), device);
-    (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
+    (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime.primary,
+                                       preflight_runtime.secondary);
 
     auto progress     = artifact_progress(options.load_progress);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
@@ -138,10 +141,16 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
-    runtime::KvCapacityResolution capacity_resolution =
-        runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());
+    const RuntimeAvailability current_runtime{
+        .primary   = free_device_bytes(device, 0),
+        .secondary = device.model_parallel() ? free_device_bytes(device, 1) : 0,
+    };
+    runtime::KvCapacityResolution capacity_resolution = runtime::resolve_kv_capacity(
+        options.kv_capacity, curve, current_runtime.primary, current_runtime.secondary);
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
+        sequence_plan.secondary_device_reservation_bytes() !=
+            capacity_resolution.secondary_runtime_reservation_bytes ||
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
@@ -149,7 +158,11 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
                                                std::move(sequence_plan), device);
     device.synchronize();
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+    instance->kv_capacity_resolution.available_after_startup_bytes = free_device_bytes(device, 0);
+    if (device.model_parallel()) {
+        instance->kv_capacity_resolution.secondary_available_after_startup_bytes =
+            free_device_bytes(device, 1);
+    }
 
     LoadSummary summary;
     summary.target               = std::string(target_key);

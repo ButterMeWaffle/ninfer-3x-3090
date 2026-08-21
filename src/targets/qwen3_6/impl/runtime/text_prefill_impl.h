@@ -61,7 +61,9 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     state.execution.secondary_work);
+                     state.execution.secondary_work, state.secondary_text_kv,
+                     state.secondary_mtp_kv, state.secondary_text_cache,
+                     state.secondary_mtp_cache, state.primary_attention_layers);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.turn_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_turn_checkpoint_hidden_output(state.turn_checkpoint_hidden);
@@ -90,7 +92,9 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     state.execution.secondary_work);
+                     state.execution.secondary_work, state.secondary_text_kv,
+                     state.secondary_mtp_kv, state.secondary_text_cache,
+                     state.secondary_mtp_cache, state.primary_attention_layers);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.turn_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_turn_checkpoint_hidden_output(state.turn_checkpoint_hidden);
@@ -103,8 +107,8 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
 
 void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
                            VisionPrefillSession& vision, const MtpBridgeInput& bridge) {
-    if (!state.mtp_kv.valid() || bridge.previous_hidden == nullptr || state.text_kv_base == 0 ||
-        bridge.position < 0 ||
+    if ((!state.mtp_kv.valid() && !state.secondary_mtp_kv.valid()) ||
+        bridge.previous_hidden == nullptr || state.text_kv_base == 0 || bridge.position < 0 ||
         static_cast<std::uint32_t>(bridge.position) + 1 != state.text_kv_base) {
         throw std::logic_error("multimodal MTP bridge does not match the reusable frontier");
     }
