@@ -159,6 +159,7 @@ public:
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
                 WorkspaceArena* secondary_work             = nullptr,
+                WorkspaceArena* tertiary_work              = nullptr,
                 qwen3_6::PagedKVCacheView secondary_kv     = qwen3_6::PagedKVCacheView(),
                 qwen3_6::PagedKVCacheView secondary_mtp_kv = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_secondary_text_kv = nullptr,
@@ -304,6 +305,7 @@ private:
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
     WorkspaceArena* secondary_work_ = nullptr;
+    WorkspaceArena* tertiary_work_  = nullptr;
     qwen3_6::PagedKVCacheView kv_;
     qwen3_6::PagedKVCacheView mtp_kv_;
     qwen3_6::PagedKVCacheView secondary_kv_;

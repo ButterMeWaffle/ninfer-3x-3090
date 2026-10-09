@@ -61,7 +61,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     state.execution.secondary_work, state.secondary_text_kv,
+                     state.execution.secondary_work, state.execution.tertiary_work, state.secondary_text_kv,
                      state.secondary_mtp_kv, state.secondary_text_cache,
                      state.secondary_mtp_cache, state.primary_attention_layers);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
@@ -92,7 +92,7 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     state.execution.secondary_work, state.secondary_text_kv,
+                     state.execution.secondary_work, state.execution.tertiary_work, state.secondary_text_kv,
                      state.secondary_mtp_kv, state.secondary_text_cache,
                      state.secondary_mtp_cache, state.primary_attention_layers);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,

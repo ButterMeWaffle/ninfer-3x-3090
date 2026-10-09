@@ -255,6 +255,8 @@ public:
     WorkspaceArena work;
     std::optional<DeviceArena> secondary_workspace_storage;
     std::optional<WorkspaceArena> secondary_work;
+    std::optional<DeviceArena> tertiary_workspace_storage;
+    std::optional<WorkspaceArena> tertiary_work;
     std::optional<DeviceArena> secondary_persistent_storage;
     std::unique_ptr<qwen3_6::PagedKVCache> secondary_text_kv;
     std::unique_ptr<qwen3_6::PagedKVCache> secondary_mtp_kv;

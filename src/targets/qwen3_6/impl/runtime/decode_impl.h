@@ -24,7 +24,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache, nullptr, state.execution.secondary_work, {}, {},
+                         &state.text_cache, nullptr, state.execution.secondary_work, state.execution.tertiary_work, {}, {},
                          state.secondary_text_cache, nullptr, state.primary_attention_layers);
 
         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);

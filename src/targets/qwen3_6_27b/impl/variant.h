@@ -85,8 +85,10 @@ struct Variant {
     static void post_mixer_graph(const Tensor& hidden, const PostMixerWeights& weights,
                                  Tensor& residual, WorkspaceArena& primary_workspace,
                                  WorkspaceArena& secondary_workspace,
+                                 WorkspaceArena* tertiary_workspace,
                                  const DeviceArena& primary_weights,
-                                 const DeviceArena& secondary_weights, DeviceContext& device);
+                                 const DeviceArena& secondary_weights,
+                                 const DeviceArena* tertiary_weights, DeviceContext& device);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
     [[nodiscard]] static std::size_t

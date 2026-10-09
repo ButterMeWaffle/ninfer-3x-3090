@@ -40,6 +40,7 @@ struct ExecutionCore {
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
     WorkspaceArena* secondary_work = nullptr;
+    WorkspaceArena* tertiary_work  = nullptr;
 };
 
 struct PrefillContext {

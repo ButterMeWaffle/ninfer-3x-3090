@@ -235,6 +235,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.weights_arena = &backing.device_arena();
     runtime.secondary_weights_arena =
         backing.device_arena_count() > 1 ? &backing.device_arena(1) : nullptr;
+    runtime.tertiary_weights_arena =
+        backing.device_arena_count() > 2 ? &backing.device_arena(2) : nullptr;
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;

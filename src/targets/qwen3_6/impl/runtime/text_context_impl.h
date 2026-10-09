@@ -225,12 +225,14 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          const qwen3_6::PagedKVCache* batch_text_kv,
                          const qwen3_6::PagedKVCache* batch_mtp_kv,
                          WorkspaceArena* secondary_work,
+                         WorkspaceArena* tertiary_work,
                          qwen3_6::PagedKVCacheView secondary_kv,
                          qwen3_6::PagedKVCacheView secondary_mtp_kv,
                          const qwen3_6::PagedKVCache* batch_secondary_text_kv,
                          const qwen3_6::PagedKVCache* batch_secondary_mtp_kv,
                          std::int32_t primary_attention_layers)
-    : ctx_(ctx), weights_(weights), work_(work), secondary_work_(secondary_work), kv_(kv),
+    : ctx_(ctx), weights_(weights), work_(work), secondary_work_(secondary_work),
+      tertiary_work_(tertiary_work), kv_(kv),
       mtp_kv_(mtp_kv), secondary_kv_(secondary_kv), secondary_mtp_kv_(secondary_mtp_kv),
       batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv),
       batch_secondary_text_kv_(batch_secondary_text_kv),
@@ -1163,9 +1165,16 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
             if (weights_.weights_arena == nullptr || weights_.secondary_weights_arena == nullptr) {
                 throw std::logic_error("graph-parallel MLP has no device-local weight shards");
             }
+            if (ctx_.size() == 3 &&
+                (tertiary_work_ == nullptr ||
+                 weights_.tertiary_weights_arena == nullptr)) {
+                throw std::logic_error("3-way graph-parallel MLP has no tertiary workspace/arena");
+            }
             Variant::post_mixer_graph(h, *m.payload, x, work_, *secondary_work_,
+                                      tertiary_work_,
                                       *weights_.weights_arena,
-                                      *weights_.secondary_weights_arena, ctx_);
+                                      *weights_.secondary_weights_arena,
+                                      weights_.tertiary_weights_arena, ctx_);
             return;
         }
     }
@@ -1181,6 +1190,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
             throw std::logic_error("graph-parallel traversal requires primary entry and workspace");
         }
         secondary_work_->reset();
+        if (tertiary_work_ != nullptr) { tertiary_work_->reset(); }
     }
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {

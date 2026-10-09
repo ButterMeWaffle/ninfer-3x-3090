@@ -161,20 +161,48 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                const artifact::MaterializedArtifact& materialized) {
     DensePostMixerPayload out;
     if (materialized.has_device_data(plan.gate_up.object, 1)) {
-        constexpr std::int32_t kPrimaryIntermediate   = 8192;
-        constexpr std::int32_t kSecondaryIntermediate = 17408 - kPrimaryIntermediate;
-        out.gate_up = artifact::materialized_weight(
-            materialized, plan.gate_up.object, plan.gate_up.format,
-            2 * kPrimaryIntermediate, 5120, 0);
-        out.down = artifact::materialized_weight(materialized, plan.down.object,
-                                                 plan.down.format, 5120,
-                                                 kPrimaryIntermediate, 0);
-        out.secondary_gate_up = artifact::materialized_weight(
-            materialized, plan.gate_up.object, plan.gate_up.format,
-            2 * kSecondaryIntermediate, 5120, 1);
-        out.secondary_down = artifact::materialized_weight(
-            materialized, plan.down.object, plan.down.format, 5120,
-            kSecondaryIntermediate, 1);
+        const bool three_way = materialized.has_device_data(plan.gate_up.object, 2);
+        if (three_way) {
+            constexpr std::int32_t kPrimaryIntermediate   = 6144;
+            constexpr std::int32_t kSecondaryIntermediate = 6144;
+            constexpr std::int32_t kTertiaryIntermediate  = 17408 - 6144 - 6144;
+            static_assert((kPrimaryIntermediate % 1024) == 0 &&
+                          (kSecondaryIntermediate % 1024) == 0 &&
+                          (kTertiaryIntermediate % 1024) == 0);
+            out.gate_up = artifact::materialized_weight(
+                materialized, plan.gate_up.object, plan.gate_up.format,
+                2 * kPrimaryIntermediate, 5120, 0);
+            out.down = artifact::materialized_weight(materialized, plan.down.object,
+                                                     plan.down.format, 5120,
+                                                     kPrimaryIntermediate, 0);
+            out.secondary_gate_up = artifact::materialized_weight(
+                materialized, plan.gate_up.object, plan.gate_up.format,
+                2 * kSecondaryIntermediate, 5120, 1);
+            out.secondary_down = artifact::materialized_weight(
+                materialized, plan.down.object, plan.down.format, 5120,
+                kSecondaryIntermediate, 1);
+            out.tertiary_gate_up = artifact::materialized_weight(
+                materialized, plan.gate_up.object, plan.gate_up.format,
+                2 * kTertiaryIntermediate, 5120, 2);
+            out.tertiary_down = artifact::materialized_weight(
+                materialized, plan.down.object, plan.down.format, 5120,
+                kTertiaryIntermediate, 2);
+        } else {
+            constexpr std::int32_t kPrimaryIntermediate   = 8192;
+            constexpr std::int32_t kSecondaryIntermediate = 17408 - kPrimaryIntermediate;
+            out.gate_up = artifact::materialized_weight(
+                materialized, plan.gate_up.object, plan.gate_up.format,
+                2 * kPrimaryIntermediate, 5120, 0);
+            out.down = artifact::materialized_weight(materialized, plan.down.object,
+                                                     plan.down.format, 5120,
+                                                     kPrimaryIntermediate, 0);
+            out.secondary_gate_up = artifact::materialized_weight(
+                materialized, plan.gate_up.object, plan.gate_up.format,
+                2 * kSecondaryIntermediate, 5120, 1);
+            out.secondary_down = artifact::materialized_weight(
+                materialized, plan.down.object, plan.down.format, 5120,
+                kSecondaryIntermediate, 1);
+        }
         return out;
     }
     out.gate_up = materialized_weight(materialized, plan.gate_up, 34816, 5120);
@@ -447,6 +475,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.weights_arena = &backing.device_arena();
     runtime.secondary_weights_arena =
         backing.device_arena_count() > 1 ? &backing.device_arena(1) : nullptr;
+    runtime.tertiary_weights_arena =
+        backing.device_arena_count() > 2 ? &backing.device_arena(2) : nullptr;
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;

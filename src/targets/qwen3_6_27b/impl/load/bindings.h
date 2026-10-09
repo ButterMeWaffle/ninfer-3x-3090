@@ -126,6 +126,8 @@ struct DensePostMixerPayload {
     Weight down;
     Weight secondary_gate_up;
     Weight secondary_down;
+    Weight tertiary_gate_up;
+    Weight tertiary_down;
 };
 
 struct SplitAttentionProjectionPayload {

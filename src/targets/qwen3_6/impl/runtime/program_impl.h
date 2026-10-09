@@ -242,6 +242,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         secondary_workspace_storage.emplace(plan.workspace.capacity);
         secondary_work.emplace(DeviceSpan{secondary_workspace_storage->base(),
                                           secondary_workspace_storage->capacity()});
+        if (device.size() > 2) {
+            ScopedDeviceRank tertiary(device, 2);
+            tertiary_workspace_storage.emplace(plan.workspace.capacity);
+            tertiary_work.emplace(DeviceSpan{tertiary_workspace_storage->base(),
+                                             tertiary_workspace_storage->capacity()});
+        }
     }
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.dflash() ||
@@ -357,6 +363,11 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     for (SequenceState& sequence : sequences) { sequence.kv.reset(); }
     if (secondary_workspace_storage) {
         ScopedDeviceRank secondary(device, 1);
+        if (tertiary_workspace_storage) {
+            ScopedDeviceRank tertiary(device, 2);
+            tertiary_work.reset();
+            tertiary_workspace_storage.reset();
+        }
         secondary_mtp_kv.reset();
         secondary_text_kv.reset();
         secondary_persistent_storage.reset();
@@ -1352,7 +1363,8 @@ void ProgramImplCore::prepare_graphs() {
                                        prefill_hidden,
                                        prefill_chunk,
                                        proposal_head,
-                                       secondary_work ? &*secondary_work : nullptr};
+                                       secondary_work ? &*secondary_work : nullptr,
+                                               tertiary_work ? &*tertiary_work : nullptr};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1633,7 +1645,8 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
                                          replay_records ? &*replay_records : nullptr, io,
                                          prefill_hidden, prefill_chunk, proposal_head,
-                                         secondary_work ? &*secondary_work : nullptr},
+                                         secondary_work ? &*secondary_work : nullptr,
+                                               tertiary_work ? &*tertiary_work : nullptr},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
@@ -1666,7 +1679,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, secondary_work ? &*secondary_work : nullptr},
+             proposal_head, secondary_work ? &*secondary_work : nullptr,
+                                               tertiary_work ? &*tertiary_work : nullptr},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             secondary_text_kv_view(sequence),
@@ -1932,7 +1946,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-            proposal_head, secondary_work ? &*secondary_work : nullptr},
+            proposal_head, secondary_work ? &*secondary_work : nullptr,
+                                               tertiary_work ? &*tertiary_work : nullptr},
             decoder->text_kv,
             secondary_text_kv.get(),
             static_cast<std::int32_t>(primary_attention_layers),
@@ -2066,7 +2081,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
-                                                 secondary_work ? &*secondary_work : nullptr},
+                                                 secondary_work ? &*secondary_work : nullptr,
+                                               tertiary_work ? &*tertiary_work : nullptr},
                                                  decoder->text_kv,
                                                  decoder->mtp_cache(),
                                                  secondary_text_kv.get(),
@@ -2233,7 +2249,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
                                                      proposal_head,
-                                                    secondary_work ? &*secondary_work : nullptr},
+                                                    secondary_work ? &*secondary_work : nullptr,
+                                               tertiary_work ? &*tertiary_work : nullptr},
                                                     decoder->text_kv,
                                                     secondary_text_kv.get(),
                                                     static_cast<std::int32_t>(

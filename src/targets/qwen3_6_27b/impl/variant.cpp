@@ -254,45 +254,34 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
 
 void Variant::post_mixer_graph(const Tensor& hidden, const PostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& primary_workspace,
-                               WorkspaceArena& secondary_workspace, const DeviceArena&,
-                               const DeviceArena&, DeviceContext& device) {
-    constexpr std::int32_t kPrimaryIntermediate   = 8192;
-    constexpr std::int32_t kSecondaryIntermediate = TextConfig::intermediate - kPrimaryIntermediate;
-    static_assert((kPrimaryIntermediate % 1024) == 0 &&
-                  (kSecondaryIntermediate % 1024) == 0);
-
-    if (!device.model_parallel() || device.active_rank() != 0 || hidden.ne[1] <= 0 ||
+                               WorkspaceArena& secondary_workspace,
+                               WorkspaceArena* tertiary_workspace, const DeviceArena&,
+                               const DeviceArena&, const DeviceArena*, DeviceContext& device) {
+    const std::int32_t tokens = hidden.ne[1];
+    if (device.active_rank() != 0 || hidden.ne[1] <= 0 ||
         weights.gate_up.qtype != QType::Q4G64_F16S || weights.down.qtype != QType::Q5G64_F16S ||
         weights.secondary_gate_up.qtype != QType::Q4G64_F16S ||
         weights.secondary_down.qtype != QType::Q5G64_F16S ||
         weights.secondary_gate_up.qdata == nullptr || weights.secondary_down.qdata == nullptr) {
         throw std::invalid_argument(
-            "27B graph-parallel MLP requires two devices, Q4 gate/up, and Q5 down");
+            "27B graph-parallel MLP requires Q4 gate/up and Q5 down shards");
+    }
+    if (device.size() == 3 &&
+        (weights.tertiary_gate_up.qtype != QType::Q4G64_F16S ||
+         weights.tertiary_down.qtype != QType::Q5G64_F16S ||
+         weights.tertiary_gate_up.qdata == nullptr || weights.tertiary_down.qdata == nullptr ||
+         tertiary_workspace == nullptr)) {
+        throw std::invalid_argument(
+            "27B 3-way graph-parallel MLP requires tertiary Q4 gate/up, Q5 down, and workspace");
     }
 
-    const std::int32_t tokens = hidden.ne[1];
+    const int primary_device   = device.device_ids()[0];
+    const int secondary_device = device.device_ids()[1];
+    const int tertiary_device  = device.size() > 2 ? device.device_ids()[2] : -1;
+    cudaStream_t primary_stream = device.stream_for_rank(0);
+    cudaEvent_t primary_ready   = device.fence_for_rank(0);
+    cudaEvent_t secondary_ready = device.fence_for_rank(1);
 
-    auto primary_scope   = primary_workspace.scope();
-    Tensor primary_act =
-        primary_workspace.alloc(DType::BF16, {kPrimaryIntermediate, tokens});
-    Tensor primary_delta = primary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
-    Tensor peer_delta    = primary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
-
-    auto secondary_scope = secondary_workspace.scope();
-    Tensor secondary_hidden =
-        secondary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
-    Tensor secondary_act =
-        secondary_workspace.alloc(DType::BF16, {kSecondaryIntermediate, tokens});
-    Tensor secondary_delta =
-        secondary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
-
-    const int primary_device      = device.device_ids()[0];
-    const int secondary_device    = device.device_ids()[1];
-    cudaStream_t primary_stream   = device.stream_for_rank(0);
-    cudaEvent_t primary_ready     = device.fence_for_rank(0);
-    cudaEvent_t secondary_ready   = device.fence_for_rank(1);
-
-    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
     const auto launch_gate_up = [&](const Tensor& input, const Weight& weight,
                                     std::int32_t row_begin, Tensor& output, cudaStream_t stream) {
         if (tokens == 1) {
@@ -317,25 +306,120 @@ void Variant::post_mixer_graph(const Tensor& hidden, const PostMixerWeights& wei
         }
     };
 
-    launch_gate_up(hidden, weights.gate_up, 0, primary_act, primary_stream);
-    launch_down(primary_act, weights.down, 0, primary_delta, primary_stream);
+    if (device.size() == 3) {
+        constexpr std::int32_t kPrimaryIntermediate   = 6144;
+        constexpr std::int32_t kSecondaryIntermediate = 6144;
+        constexpr std::int32_t kTertiaryIntermediate  =
+            TextConfig::intermediate - kPrimaryIntermediate - kSecondaryIntermediate;
+        static_assert((kPrimaryIntermediate % 1024) == 0 &&
+                      (kSecondaryIntermediate % 1024) == 0 &&
+                      (kTertiaryIntermediate % 1024) == 0);
 
-    {
-        ScopedDeviceRank secondary(device, 1);
-        cudaStream_t secondary_stream = device.stream;
-        CUDA_CHECK(cudaStreamWaitEvent(secondary_stream, primary_ready, 0));
-        CUDA_CHECK(cudaMemcpyPeerAsync(secondary_hidden.data, secondary_device, hidden.data,
-                                       primary_device, hidden.bytes(), secondary_stream));
-        launch_gate_up(secondary_hidden, weights.secondary_gate_up, 0, secondary_act,
-                       secondary_stream);
-        launch_down(secondary_act, weights.secondary_down, 0, secondary_delta, secondary_stream);
-        CUDA_CHECK(cudaEventRecord(secondary_ready, secondary_stream));
+        auto primary_scope   = primary_workspace.scope();
+        Tensor primary_act =
+            primary_workspace.alloc(DType::BF16, {kPrimaryIntermediate, tokens});
+        Tensor primary_delta = primary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+        Tensor peer1_delta   = primary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+        Tensor peer2_delta   = primary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+
+        auto secondary_scope = secondary_workspace.scope();
+        Tensor secondary_hidden =
+            secondary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+        Tensor secondary_act =
+            secondary_workspace.alloc(DType::BF16, {kSecondaryIntermediate, tokens});
+        Tensor secondary_delta =
+            secondary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+
+        auto tertiary_scope = tertiary_workspace->scope();
+        Tensor tertiary_hidden =
+            tertiary_workspace->alloc(DType::BF16, {TextConfig::hidden, tokens});
+        Tensor tertiary_act =
+            tertiary_workspace->alloc(DType::BF16, {kTertiaryIntermediate, tokens});
+        Tensor tertiary_delta =
+            tertiary_workspace->alloc(DType::BF16, {TextConfig::hidden, tokens});
+
+        cudaEvent_t tertiary_ready = device.fence_for_rank(2);
+
+        CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+        launch_gate_up(hidden, weights.gate_up, 0, primary_act, primary_stream);
+        launch_down(primary_act, weights.down, 0, primary_delta, primary_stream);
+
+        {
+            ScopedDeviceRank secondary(device, 1);
+            cudaStream_t secondary_stream = device.stream;
+            CUDA_CHECK(cudaStreamWaitEvent(secondary_stream, primary_ready, 0));
+            CUDA_CHECK(cudaMemcpyPeerAsync(secondary_hidden.data, secondary_device, hidden.data,
+                                           primary_device, hidden.bytes(), secondary_stream));
+            launch_gate_up(secondary_hidden, weights.secondary_gate_up, 0, secondary_act,
+                           secondary_stream);
+            launch_down(secondary_act, weights.secondary_down, 0, secondary_delta,
+                        secondary_stream);
+            CUDA_CHECK(cudaEventRecord(secondary_ready, secondary_stream));
+        }
+
+        {
+            ScopedDeviceRank tertiary(device, 2);
+            cudaStream_t tertiary_stream = device.stream;
+            CUDA_CHECK(cudaStreamWaitEvent(tertiary_stream, primary_ready, 0));
+            CUDA_CHECK(cudaMemcpyPeerAsync(tertiary_hidden.data, tertiary_device, hidden.data,
+                                           primary_device, hidden.bytes(), tertiary_stream));
+            launch_gate_up(tertiary_hidden, weights.tertiary_gate_up, 0, tertiary_act,
+                           tertiary_stream);
+            launch_down(tertiary_act, weights.tertiary_down, 0, tertiary_delta,
+                        tertiary_stream);
+            CUDA_CHECK(cudaEventRecord(tertiary_ready, tertiary_stream));
+        }
+
+        CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(peer1_delta.data, primary_device, secondary_delta.data,
+                                       secondary_device, peer1_delta.bytes(), primary_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(primary_stream, tertiary_ready, 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(peer2_delta.data, primary_device, tertiary_delta.data,
+                                       tertiary_device, peer2_delta.bytes(), primary_stream));
+        ops::detail::residual_add_three_launch(primary_delta, peer1_delta, peer2_delta, residual,
+                                               primary_stream);
+    } else {
+        constexpr std::int32_t kPrimaryIntermediate   = 8192;
+        constexpr std::int32_t kSecondaryIntermediate = TextConfig::intermediate - kPrimaryIntermediate;
+        static_assert((kPrimaryIntermediate % 1024) == 0 &&
+                      (kSecondaryIntermediate % 1024) == 0);
+
+        auto primary_scope   = primary_workspace.scope();
+        Tensor primary_act =
+            primary_workspace.alloc(DType::BF16, {kPrimaryIntermediate, tokens});
+        Tensor primary_delta = primary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+        Tensor peer_delta    = primary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+
+        auto secondary_scope = secondary_workspace.scope();
+        Tensor secondary_hidden =
+            secondary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+        Tensor secondary_act =
+            secondary_workspace.alloc(DType::BF16, {kSecondaryIntermediate, tokens});
+        Tensor secondary_delta =
+            secondary_workspace.alloc(DType::BF16, {TextConfig::hidden, tokens});
+
+        CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+        launch_gate_up(hidden, weights.gate_up, 0, primary_act, primary_stream);
+        launch_down(primary_act, weights.down, 0, primary_delta, primary_stream);
+
+        {
+            ScopedDeviceRank secondary(device, 1);
+            cudaStream_t secondary_stream = device.stream;
+            CUDA_CHECK(cudaStreamWaitEvent(secondary_stream, primary_ready, 0));
+            CUDA_CHECK(cudaMemcpyPeerAsync(secondary_hidden.data, secondary_device, hidden.data,
+                                           primary_device, hidden.bytes(), secondary_stream));
+            launch_gate_up(secondary_hidden, weights.secondary_gate_up, 0, secondary_act,
+                           secondary_stream);
+            launch_down(secondary_act, weights.secondary_down, 0, secondary_delta,
+                        secondary_stream);
+            CUDA_CHECK(cudaEventRecord(secondary_ready, secondary_stream));
+        }
+
+        CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(peer_delta.data, primary_device, secondary_delta.data,
+                                       secondary_device, peer_delta.bytes(), primary_stream));
+        ops::detail::residual_add_two_launch(primary_delta, peer_delta, residual, primary_stream);
     }
-
-    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
-    CUDA_CHECK(cudaMemcpyPeerAsync(peer_delta.data, primary_device, secondary_delta.data,
-                                   secondary_device, peer_delta.bytes(), primary_stream));
-    ops::detail::residual_add_two_launch(primary_delta, peer_delta, residual, primary_stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
