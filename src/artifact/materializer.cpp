@@ -524,6 +524,10 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                     static_cast<std::size_t>(plan.tertiary_device_capacity_bytes)));
                 out.device_arena_devices_.push_back(tertiary_device);
             }
+            const std::size_t final_arena_count = out.device_arenas_.size();
+            for (auto& obj : out.objects_) {
+                obj.device.resize(final_arena_count, nullptr);
+            }
 
             for (const DeviceMaterialization& placement : plan.device_objects) {
                 const DeviceSpan primary_storage = allocate_planned(
