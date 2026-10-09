@@ -101,7 +101,7 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options),
-                              options.devices.size() == 2)));
+                              static_cast<int>(options.devices.size())));
 }
 
 std::unique_ptr<Package::LoadedModel>

@@ -113,6 +113,14 @@ void Binder::materialize_on_device(ObjectHandle handle) {
 
 void Binder::shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAxis axis,
                                             std::uint64_t split) {
+    shard_row_split_across_devices(handle, axis, std::span<const std::uint64_t>(&split, 1));
+}
+
+void Binder::shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAxis axis,
+                                            std::span<const std::uint64_t> splits) {
+    if (splits.empty() || splits.size() > 2) {
+        throw ArtifactError("cross-device shard requires one or two split boundaries");
+    }
     const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
     if (tensor == nullptr || tensor->layout != StorageLayout::RowSplitK128V1 ||
         tensor->shape.size() != 2) {
@@ -135,25 +143,35 @@ void Binder::shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAx
 
     const std::uint64_t rows = tensor->shape[0];
     const std::uint64_t cols = tensor->shape[1];
+    // Validate each boundary is strictly increasing, positive, and within the logical extent.
+    std::uint64_t prev = 0;
+    for (const std::uint64_t boundary : splits) {
+        if (boundary <= prev) {
+            throw ArtifactError("cross-device shard splits must be strictly increasing");
+        }
+        prev = boundary;
+    }
     if (axis == RowSplitShardAxis::PairedRows) {
-        if ((rows % 2) != 0 || split == 0 || split >= rows / 2) {
-            throw ArtifactError("paired-row shard split is outside the logical row range");
+        if ((rows % 2) != 0 || prev >= rows / 2) {
+            throw ArtifactError("paired-row shard splits are outside the logical row range");
         }
     } else {
-        if (split == 0 || split >= cols) {
-            throw ArtifactError("column shard split is outside the logical column range");
+        if (prev >= cols) {
+            throw ArtifactError("column shard splits are outside the logical column range");
         }
-        const std::array<std::uint64_t, 2> split_shape = {1, split};
-        if (row_split_geometry(tensor->format, split_shape).padded_columns != split) {
-            throw ArtifactError(
-                "column shard split must preserve the row-split-k128 group boundary");
+        for (const std::uint64_t boundary : splits) {
+            const std::array<std::uint64_t, 2> boundary_shape = {1, boundary};
+            if (row_split_geometry(tensor->format, boundary_shape).padded_columns != boundary) {
+                throw ArtifactError(
+                    "column shard splits must preserve the row-split-k128 group boundary");
+            }
         }
     }
 
     materialization_.row_split_shards.push_back(RowSplitShardMaterialization{
         .object = handle,
         .axis   = axis,
-        .split  = split,
+        .splits = std::vector<std::uint64_t>(splits.begin(), splits.end()),
     });
 }
 
@@ -198,6 +216,7 @@ MaterializationPlan Binder::finish() {
             materialization_.device_capacity_bytes;
         std::uint64_t primary_capacity   = 0;
         std::uint64_t secondary_capacity = 0;
+        std::uint64_t tertiary_capacity  = 0;
         for (DeviceMaterialization& placement : materialization_.device_objects) {
             placement.primary_offset = align_up(primary_capacity, placement.alignment);
             const auto shard = std::find_if(
@@ -212,26 +231,44 @@ MaterializationPlan Binder::finish() {
                 const auto& tensor = std::get<TensorDescriptor>(descriptor(placement.object));
                 const std::uint64_t rows = tensor.shape[0];
                 const std::uint64_t cols = tensor.shape[1];
-                std::array<std::uint64_t, 2> primary_shape{};
-                std::array<std::uint64_t, 2> secondary_shape{};
-                if (shard->axis == RowSplitShardAxis::PairedRows) {
-                    const std::uint64_t intermediate = rows / 2;
-                    primary_shape   = {2 * shard->split, cols};
-                    secondary_shape = {2 * (intermediate - shard->split), cols};
-                } else {
-                    primary_shape   = {rows, shard->split};
-                    secondary_shape = {rows, cols - shard->split};
-                }
+                // Per-rank extent: rank 0 owns [0, splits[0]), rank i owns (splits[i-1],
+                // splits[i]), the last rank owns (splits[last], extent).
+                const auto rank_bounds = [&](std::size_t rank) -> std::uint64_t {
+                    if (rank < shard->splits.size()) { return shard->splits[rank]; }
+                    return (shard->axis == RowSplitShardAxis::PairedRows) ? rows / 2 : cols;
+                };
+                const std::size_t rank_count = shard->splits.size() + 1;
+                auto rank_shape = [&](std::size_t rank) -> std::array<std::uint64_t, 2> {
+                    const std::uint64_t begin = rank == 0 ? 0 : shard->splits[rank - 1];
+                    const std::uint64_t end   = rank_bounds(rank);
+                    if (shard->axis == RowSplitShardAxis::PairedRows) {
+                        return {2 * (end - begin), cols};
+                    }
+                    return {rows, end - begin};
+                };
                 placement.primary_bytes =
-                    row_split_geometry(tensor.format, primary_shape).encoded_bytes;
-                shard->secondary_offset = align_up(secondary_capacity, placement.alignment);
-                shard->secondary_bytes =
-                    row_split_geometry(tensor.format, secondary_shape).encoded_bytes;
-                if (shard->secondary_bytes >
-                    std::numeric_limits<std::uint64_t>::max() - shard->secondary_offset) {
-                    throw ArtifactError("secondary materialization plan size overflows u64");
+                    row_split_geometry(tensor.format, rank_shape(0)).encoded_bytes;
+                shard->secondary_offsets.resize(rank_count - 1);
+                shard->secondary_bytes.resize(rank_count - 1);
+                for (std::size_t rank = 1; rank < rank_count; ++rank) {
+                    const std::uint64_t offset = (rank == 1)
+                                                      ? align_up(secondary_capacity, placement.alignment)
+                                                      : align_up(tertiary_capacity, placement.alignment);
+                    const std::uint64_t bytes =
+                        row_split_geometry(tensor.format, rank_shape(rank)).encoded_bytes;
+                    if (bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
+                        throw ArtifactError("secondary materialization plan size overflows u64");
+                    }
+                    if (rank == 1) {
+                        shard->secondary_offsets[rank - 1] = offset;
+                        shard->secondary_bytes[rank - 1]   = bytes;
+                        secondary_capacity = offset + bytes;
+                    } else {
+                        shard->secondary_offsets[rank - 1] = offset;
+                        shard->secondary_bytes[rank - 1]   = bytes;
+                        tertiary_capacity = offset + bytes;
+                    }
                 }
-                secondary_capacity = shard->secondary_offset + shard->secondary_bytes;
             }
             if (placement.primary_bytes >
                 std::numeric_limits<std::uint64_t>::max() - placement.primary_offset) {
@@ -241,6 +278,7 @@ MaterializationPlan Binder::finish() {
         }
         materialization_.device_capacity_bytes           = primary_capacity;
         materialization_.secondary_device_capacity_bytes = secondary_capacity;
+        materialization_.tertiary_device_capacity_bytes  = tertiary_capacity;
     }
     return std::move(materialization_);
 }

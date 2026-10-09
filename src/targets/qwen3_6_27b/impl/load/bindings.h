@@ -119,7 +119,7 @@ struct ArtifactLoadPlan {
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features,
-                               bool graph_parallel = false);
+                               int device_count = 1);
 
 struct DensePostMixerPayload {
     Weight gate_up;

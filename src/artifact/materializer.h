@@ -62,7 +62,7 @@ private:
     void release_device_arenas() noexcept;
 
     struct ObjectStorage {
-        std::array<void*, 2> device = {nullptr, nullptr};
+        std::vector<void*> device;
         std::vector<std::byte> resource;
     };
 

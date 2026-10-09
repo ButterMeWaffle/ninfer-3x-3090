@@ -35,10 +35,14 @@ enum class RowSplitShardAxis : std::uint8_t {
 
 struct RowSplitShardMaterialization {
     ObjectHandle object;
-    RowSplitShardAxis axis          = RowSplitShardAxis::Columns;
-    std::uint64_t split             = 0;
-    std::uint64_t secondary_offset = 0;
-    std::uint64_t secondary_bytes  = 0;
+    RowSplitShardAxis axis = RowSplitShardAxis::Columns;
+    // Boundary after each rank: rank i owns [splits[i-1], splits[i]) where splits[-1] = 0 and the
+    // final rank owns up to the full extent. Length = rank count - 1 (>= 1).
+    std::vector<std::uint64_t> splits;
+    // Per-secondary-rank packed geometry, filled in Binder::finish() (rank 0 lives in
+    // DeviceMaterialization::primary_offset/primary_bytes).
+    std::vector<std::uint64_t> secondary_offsets;
+    std::vector<std::uint64_t> secondary_bytes;
 };
 
 struct HostMaterialization {
@@ -50,6 +54,7 @@ struct MaterializationPlan {
     std::uint64_t device_capacity_bytes          = 0;
     std::uint64_t source_device_capacity_bytes    = 0;
     std::uint64_t secondary_device_capacity_bytes = 0;
+    std::uint64_t tertiary_device_capacity_bytes = 0;
     std::vector<DeviceMaterialization> device_objects;
     std::vector<RowSplitShardMaterialization> row_split_shards;
     std::vector<HostMaterialization> host_objects;
@@ -70,6 +75,8 @@ public:
     void materialize_on_device(ObjectHandle handle);
     void shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAxis axis,
                                         std::uint64_t split);
+    void shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAxis axis,
+                                        std::span<const std::uint64_t> splits);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     MaterializationPlan finish();

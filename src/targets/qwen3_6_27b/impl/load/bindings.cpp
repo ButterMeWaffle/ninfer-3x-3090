@@ -382,7 +382,7 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 } // namespace
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features, bool graph_parallel) {
+                               qwen3_6::StartupFeatures features, int device_count) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
@@ -402,15 +402,24 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     default:
         throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
     }
-    if (graph_parallel) {
-        constexpr std::uint64_t kPrimaryIntermediate = 8192;
+    if (device_count > 1) {
         for (const TextLayerPlan& layer : out.text_layers) {
-            binder.shard_row_split_across_devices(
-                layer.mlp.gate_up.object, artifact::RowSplitShardAxis::PairedRows,
-                kPrimaryIntermediate);
-            binder.shard_row_split_across_devices(
-                layer.mlp.down.object, artifact::RowSplitShardAxis::Columns,
-                kPrimaryIntermediate);
+            if (device_count == 3) {
+                // 3-way: 6144 / 6144 / 5120 (gate_up paired-rows, down columns).
+                const std::uint64_t splits3[] = {6144, 12288};
+                binder.shard_row_split_across_devices(
+                    layer.mlp.gate_up.object, artifact::RowSplitShardAxis::PairedRows,
+                    std::span<const std::uint64_t>(splits3, 2));
+                binder.shard_row_split_across_devices(
+                    layer.mlp.down.object, artifact::RowSplitShardAxis::Columns,
+                    std::span<const std::uint64_t>(splits3, 2));
+            } else {
+                // 2-way: 8192 / 9216.
+                binder.shard_row_split_across_devices(
+                    layer.mlp.gate_up.object, artifact::RowSplitShardAxis::PairedRows, 8192);
+                binder.shard_row_split_across_devices(
+                    layer.mlp.down.object, artifact::RowSplitShardAxis::Columns, 8192);
+            }
         }
     }
     out.final_norm =
