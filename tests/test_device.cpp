@@ -48,25 +48,30 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
     return failures;
 }
 
-std::vector<int> find_peer_pair(int count) {
-    for (int first = 0; first < count; ++first) {
-        cudaDeviceProp first_properties{};
-        CUDA_CHECK(cudaGetDeviceProperties(&first_properties, first));
-        for (int second = first + 1; second < count; ++second) {
-            cudaDeviceProp second_properties{};
-            CUDA_CHECK(cudaGetDeviceProperties(&second_properties, second));
-            int first_to_second = 0;
-            int second_to_first = 0;
-            CUDA_CHECK(cudaDeviceCanAccessPeer(&first_to_second, first, second));
-            CUDA_CHECK(cudaDeviceCanAccessPeer(&second_to_first, second, first));
-            if (first_to_second != 0 && second_to_first != 0 &&
-                first_properties.major == second_properties.major &&
-                first_properties.minor == second_properties.minor) {
-                return {first, second};
+std::vector<int> find_peer_set(int count, int wanted) {
+    std::vector<int> chosen;
+    for (int id = 0; id < count && static_cast<int>(chosen.size()) < wanted; ++id) {
+        if (std::find(chosen.begin(), chosen.end(), id) != chosen.end()) { continue; }
+        cudaDeviceProp properties{};
+        CUDA_CHECK(cudaGetDeviceProperties(&properties, id));
+        bool fits = true;
+        for (const int peer : chosen) {
+            cudaDeviceProp peer_properties{};
+            CUDA_CHECK(cudaGetDeviceProperties(&peer_properties, peer));
+            int id_to_peer = 0;
+            int peer_to_id = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&id_to_peer, id, peer));
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&peer_to_id, peer, id));
+            if (id_to_peer == 0 || peer_to_id == 0 || properties.major != peer_properties.major ||
+                properties.minor != peer_properties.minor) {
+                fits = false;
+                break;
             }
         }
+        if (fits) { chosen.push_back(id); }
     }
-    return {};
+    return chosen.size() == static_cast<std::size_t>(wanted) ? chosen
+                                                             : std::vector<int>{};
 }
 
 } // namespace
@@ -120,7 +125,7 @@ int main() {
         std::cerr << "timer elapsed time was negative\n";
     }
 
-    const std::vector<int> peer_pair = find_peer_pair(count);
+    const std::vector<int> peer_pair = find_peer_set(count, 2);
     if (!peer_pair.empty()) {
         ninfer::DeviceContext dual{std::span<const int>(peer_pair)};
         if (!dual.model_parallel() || dual.size() != 2 || dual.device_ids() != peer_pair ||
@@ -148,6 +153,27 @@ int main() {
             ++failures;
             std::cerr << "duplicate device ids were accepted\n";
         }
+    }
+
+    const std::vector<int> peer_triple = find_peer_set(count, 3);
+    if (!peer_triple.empty()) {
+        ninfer::DeviceContext triple{std::span<const int>(peer_triple)};
+        if (!triple.model_parallel() || triple.size() != 3 ||
+            triple.device_ids() != peer_triple || triple.active_rank() != 0 ||
+            triple.fence_for_rank(0) == nullptr || triple.fence_for_rank(1) == nullptr ||
+            triple.fence_for_rank(2) == nullptr) {
+            ++failures;
+            std::cerr << "three-device context topology is invalid\n";
+        }
+        triple.activate_rank(2);
+        int active_device = -1;
+        CUDA_CHECK(cudaGetDevice(&active_device));
+        if (active_device != peer_triple[2] || triple.device != peer_triple[2]) {
+            ++failures;
+            std::cerr << "rank activation did not select the third device\n";
+        }
+        triple.activate_rank(0);
+        triple.synchronize();
     }
 
     return failures == 0 ? 0 : fail("device test failed");

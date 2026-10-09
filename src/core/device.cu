@@ -54,8 +54,8 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
         throw std::runtime_error(cuda_error_message("cudaGetDeviceCount failed", err));
     }
     if (count <= 0) { throw std::runtime_error("no CUDA devices available"); }
-    if (device_ids.empty() || device_ids.size() > 2) {
-        throw std::invalid_argument("DeviceContext requires one or two CUDA devices");
+    if (device_ids.empty()) {
+        throw std::invalid_argument("DeviceContext requires at least one CUDA device");
     }
     device_ids_.assign(device_ids.begin(), device_ids.end());
     for (std::size_t i = 0; i < device_ids_.size(); ++i) {
@@ -98,37 +98,39 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
             }
         }
 
-        if (endpoints_.size() == 2) {
-            const Endpoint& first  = endpoints_[0];
-            const Endpoint& second = endpoints_[1];
-            if (first.props.major != second.props.major ||
-                first.props.minor != second.props.minor) {
-                throw std::invalid_argument(
-                    "model-parallel CUDA devices must have the same compute capability");
-            }
-            for (std::size_t source = 0; source < 2; ++source) {
-                const std::size_t destination = 1 - source;
-                int can_access                = 0;
-                err = cudaDeviceCanAccessPeer(&can_access, endpoints_[source].device,
-                                              endpoints_[destination].device);
-                if (err != cudaSuccess) {
-                    throw std::runtime_error(
-                        cuda_error_message("cudaDeviceCanAccessPeer failed", err));
-                }
-                if (can_access == 0) {
+        if (endpoints_.size() > 1) {
+            for (std::size_t rank = 1; rank < endpoints_.size(); ++rank) {
+                if (endpoints_[rank].props.major != endpoints_[0].props.major ||
+                    endpoints_[rank].props.minor != endpoints_[0].props.minor) {
                     throw std::invalid_argument(
-                        "model-parallel CUDA devices do not support peer access");
+                        "model-parallel CUDA devices must have the same compute capability");
                 }
-                err = cudaSetDevice(endpoints_[source].device);
-                if (err != cudaSuccess) {
-                    throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
-                }
-                err = cudaDeviceEnablePeerAccess(endpoints_[destination].device, 0);
-                if (err == cudaErrorPeerAccessAlreadyEnabled) {
-                    (void)cudaGetLastError();
-                } else if (err != cudaSuccess) {
-                    throw std::runtime_error(
-                        cuda_error_message("cudaDeviceEnablePeerAccess failed", err));
+            }
+            for (std::size_t source = 0; source < endpoints_.size(); ++source) {
+                for (std::size_t destination = 0; destination < endpoints_.size(); ++destination) {
+                    if (source == destination) { continue; }
+                    int can_access = 0;
+                    err = cudaDeviceCanAccessPeer(&can_access, endpoints_[source].device,
+                                                  endpoints_[destination].device);
+                    if (err != cudaSuccess) {
+                        throw std::runtime_error(
+                            cuda_error_message("cudaDeviceCanAccessPeer failed", err));
+                    }
+                    if (can_access == 0) {
+                        throw std::invalid_argument(
+                            "model-parallel CUDA devices do not support peer access");
+                    }
+                    err = cudaSetDevice(endpoints_[source].device);
+                    if (err != cudaSuccess) {
+                        throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
+                    }
+                    err = cudaDeviceEnablePeerAccess(endpoints_[destination].device, 0);
+                    if (err == cudaErrorPeerAccessAlreadyEnabled) {
+                        (void)cudaGetLastError();
+                    } else if (err != cudaSuccess) {
+                        throw std::runtime_error(
+                            cuda_error_message("cudaDeviceEnablePeerAccess failed", err));
+                    }
                 }
             }
         }
@@ -215,7 +217,7 @@ std::size_t DeviceContext::total_vram() const noexcept { return props.totalGloba
 
 std::size_t DeviceContext::size() const noexcept { return endpoints_.size(); }
 
-bool DeviceContext::model_parallel() const noexcept { return endpoints_.size() == 2; }
+bool DeviceContext::model_parallel() const noexcept { return endpoints_.size() > 1; }
 
 std::size_t DeviceContext::active_rank() const noexcept { return active_rank_; }
 
