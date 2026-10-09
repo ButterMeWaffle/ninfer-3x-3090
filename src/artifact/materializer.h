@@ -24,6 +24,7 @@ struct MaterializationStats {
     std::uint64_t h2d_bytes                        = 0;
     std::uint64_t device_capacity_bytes            = 0;
     std::uint64_t secondary_device_capacity_bytes = 0;
+    std::uint64_t tertiary_device_capacity_bytes   = 0;
     std::uint64_t peer_to_peer_bytes               = 0;
     std::uint64_t retained_resource_bytes          = 0;
     std::uint64_t peak_staging_bytes               = 0;
