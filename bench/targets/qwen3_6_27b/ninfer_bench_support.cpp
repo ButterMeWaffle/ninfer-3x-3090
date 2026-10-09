@@ -69,13 +69,25 @@ std::vector<int> parse_int_list(std::string_view value, const char* label) {
 }
 
 std::vector<int> parse_devices(std::string_view value) {
-    const std::size_t comma = value.find(',');
-    if (comma == std::string_view::npos || comma == 0 || comma + 1 >= value.size() ||
-        value.find(',', comma + 1) != std::string_view::npos) {
-        throw std::invalid_argument("--devices expects exactly two CUDA device ordinals");
+    std::vector<int> devices;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const std::size_t comma = value.find(',', start);
+        const std::size_t end   = comma == std::string_view::npos ? value.size() : comma;
+        if (end == start) {
+            throw std::invalid_argument("invalid devices: " + std::string(value));
+        }
+        devices.push_back(parse_nonnegative(value.substr(start, end - start), "devices"));
+        if (devices.size() > 3) {
+            throw std::invalid_argument("--devices supports up to three CUDA devices");
+        }
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
     }
-    return {parse_nonnegative(value.substr(0, comma), "devices"),
-            parse_nonnegative(value.substr(comma + 1), "devices")};
+    if (devices.empty()) {
+        throw std::invalid_argument("--devices must not be empty");
+    }
+    return devices;
 }
 
 std::vector<std::pair<int, int>> parse_pair_list(std::string_view value, const char* label) {

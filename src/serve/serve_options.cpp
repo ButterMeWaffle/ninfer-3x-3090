@@ -32,8 +32,8 @@ std::vector<int> parse_devices(const char* text) {
         if (end == begin) { throw std::invalid_argument("invalid devices: " + std::string(input)); }
         const std::string token(input.substr(begin, end - begin));
         devices.push_back(parse_nonnegative_int(token.c_str(), "devices"));
-        if (devices.size() > 2) {
-            throw std::invalid_argument("--devices supports exactly one or two CUDA devices");
+        if (devices.size() > 3) {
+            throw std::invalid_argument("--devices supports up to three CUDA devices");
         }
         if (comma == std::string_view::npos) { break; }
         begin = comma + 1;
