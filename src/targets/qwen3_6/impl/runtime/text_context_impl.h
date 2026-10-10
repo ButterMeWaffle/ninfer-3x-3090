@@ -230,14 +230,24 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          qwen3_6::PagedKVCacheView secondary_mtp_kv,
                          const qwen3_6::PagedKVCache* batch_secondary_text_kv,
                          const qwen3_6::PagedKVCache* batch_secondary_mtp_kv,
-                         std::int32_t primary_attention_layers)
+                         qwen3_6::PagedKVCacheView tertiary_kv,
+                         qwen3_6::PagedKVCacheView tertiary_mtp_kv,
+                         const qwen3_6::PagedKVCache* batch_tertiary_text_kv,
+                         const qwen3_6::PagedKVCache* batch_tertiary_mtp_kv,
+                         std::int32_t primary_attention_layers,
+                         std::int32_t secondary_attention_layers)
     : ctx_(ctx), weights_(weights), work_(work), secondary_work_(secondary_work),
       tertiary_work_(tertiary_work), kv_(kv),
       mtp_kv_(mtp_kv), secondary_kv_(secondary_kv), secondary_mtp_kv_(secondary_mtp_kv),
+      tertiary_kv_(tertiary_kv), tertiary_mtp_kv_(tertiary_mtp_kv),
       batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv),
       batch_secondary_text_kv_(batch_secondary_text_kv),
       batch_secondary_mtp_kv_(batch_secondary_mtp_kv),
-      primary_attention_layers_(primary_attention_layers), state_(state), io_(io),
+      batch_tertiary_text_kv_(batch_tertiary_text_kv),
+      batch_tertiary_mtp_kv_(batch_tertiary_mtp_kv),
+      primary_attention_layers_(primary_attention_layers),
+      secondary_attention_layers_(secondary_attention_layers),
+      state_(state), io_(io),
       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -247,10 +257,22 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
         primary_attention_layers_ > TextConfig::full_attention_layers()) {
         throw std::invalid_argument("TextContext primary attention layer split is invalid");
     }
+    if (secondary_attention_layers_ < 0 ||
+        primary_attention_layers_ + secondary_attention_layers_ >
+            TextConfig::full_attention_layers()) {
+        throw std::invalid_argument("TextContext secondary attention layer split is invalid");
+    }
     if (primary_attention_layers_ != TextConfig::full_attention_layers() &&
         (!ctx_.model_parallel() || secondary_work_ == nullptr ||
          batch_secondary_text_kv_ == nullptr)) {
         throw std::invalid_argument("TextContext sharded attention binding is incomplete");
+    }
+    if (secondary_attention_layers_ > 0 &&
+        primary_attention_layers_ + secondary_attention_layers_ !=
+            TextConfig::full_attention_layers() &&
+        (!ctx_.model_parallel() || tertiary_work_ == nullptr ||
+         batch_tertiary_text_kv_ == nullptr)) {
+        throw std::invalid_argument("TextContext tertiary attention binding is incomplete");
     }
     if (mtp_enabled() && !io_.mtp_decode && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
@@ -312,6 +334,61 @@ void TextContext::remote_gqa_attention(const Tensor& q, const Tensor& k, const T
                                    secondary_device, output.bytes(), primary_stream));
 }
 
+void TextContext::remote_gqa_attention_tertiary(const Tensor& q, const Tensor& k, const Tensor& v,
+                                                const Tensor& positions,
+                                                const Tensor& valid_columns,
+                                                const Tensor& kv_table_rows,
+                                                PagedKVBatchLayerView cache,
+                                                ops::GqaExecutionEnvelope envelope,
+                                                Tensor& output) {
+    if (tertiary_work_ == nullptr || !ctx_.model_parallel() || ctx_.active_rank() != 0) {
+        throw std::logic_error(
+            "tertiary remote GQA requires primary-rank 3-way graph-parallel execution");
+    }
+    auto scope = tertiary_work_->scope();
+    const auto allocate_like = [&](const Tensor& source) {
+        return tertiary_work_->alloc(
+            source.dtype, {source.ne[0], source.ne[1], source.ne[2], source.ne[3]});
+    };
+    Tensor remote_q         = allocate_like(q);
+    Tensor remote_k         = allocate_like(k);
+    Tensor remote_v         = allocate_like(v);
+    Tensor remote_positions = allocate_like(positions);
+    Tensor remote_rows      = allocate_like(kv_table_rows);
+    Tensor remote_valid;
+    if (valid_columns.data != nullptr) { remote_valid = allocate_like(valid_columns); }
+    Tensor remote_output = allocate_like(output);
+
+    const int primary_device  = ctx_.device_ids()[0];
+    const int tertiary_device = ctx_.device_ids()[2];
+    cudaStream_t primary_stream = ctx_.stream_for_rank(0);
+    cudaEvent_t primary_ready   = ctx_.fence_for_rank(0);
+    cudaEvent_t tertiary_ready  = ctx_.fence_for_rank(2);
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    {
+        ScopedDeviceRank tertiary(ctx_, 2);
+        cudaStream_t stream = ctx_.stream;
+        CUDA_CHECK(cudaStreamWaitEvent(stream, primary_ready, 0));
+        const auto copy = [&](Tensor& destination, const Tensor& source) {
+            CUDA_CHECK(cudaMemcpyPeerAsync(destination.data, tertiary_device, source.data,
+                                           primary_device, source.bytes(), stream));
+        };
+        copy(remote_q, q);
+        copy(remote_k, k);
+        copy(remote_v, v);
+        copy(remote_positions, positions);
+        copy(remote_rows, kv_table_rows);
+        if (remote_valid.data != nullptr) { copy(remote_valid, valid_columns); }
+        ops::gqa_attention(remote_q, remote_k, remote_v, remote_positions, remote_valid,
+                           remote_rows, kAttnScale, cache, envelope, *tertiary_work_,
+                           remote_output, stream);
+        CUDA_CHECK(cudaEventRecord(tertiary_ready, stream));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, tertiary_ready, 0));
+    CUDA_CHECK(cudaMemcpyPeerAsync(output.data, primary_device, remote_output.data,
+                                   tertiary_device, output.bytes(), primary_stream));
+}
+
 void TextContext::remote_gqa_attention_cached(const Tensor& q, const Tensor& positions,
                                               PagedKVLayerView cache,
                                               ops::GqaExecutionEnvelope envelope,
@@ -351,6 +428,46 @@ void TextContext::remote_gqa_attention_cached(const Tensor& q, const Tensor& pos
                                    secondary_device, output.bytes(), primary_stream));
 }
 
+void TextContext::remote_gqa_attention_cached_tertiary(const Tensor& q, const Tensor& positions,
+                                                       PagedKVLayerView cache,
+                                                       ops::GqaExecutionEnvelope envelope,
+                                                       Tensor& output) {
+    if (tertiary_work_ == nullptr || !ctx_.model_parallel() || ctx_.active_rank() != 0) {
+        throw std::logic_error(
+            "tertiary remote cached GQA requires primary-rank 3-way graph execution");
+    }
+    auto scope = tertiary_work_->scope();
+    Tensor remote_q = tertiary_work_->alloc(
+        q.dtype, {q.ne[0], q.ne[1], q.ne[2], q.ne[3]});
+    Tensor remote_positions = tertiary_work_->alloc(
+        positions.dtype,
+        {positions.ne[0], positions.ne[1], positions.ne[2], positions.ne[3]});
+    Tensor remote_output = tertiary_work_->alloc(
+        output.dtype, {output.ne[0], output.ne[1], output.ne[2], output.ne[3]});
+
+    const int primary_device  = ctx_.device_ids()[0];
+    const int tertiary_device = ctx_.device_ids()[2];
+    cudaStream_t primary_stream = ctx_.stream_for_rank(0);
+    cudaEvent_t primary_ready   = ctx_.fence_for_rank(0);
+    cudaEvent_t tertiary_ready  = ctx_.fence_for_rank(2);
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    {
+        ScopedDeviceRank tertiary(ctx_, 2);
+        cudaStream_t stream = ctx_.stream;
+        CUDA_CHECK(cudaStreamWaitEvent(stream, primary_ready, 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_q.data, tertiary_device, q.data, primary_device,
+                                       q.bytes(), stream));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_positions.data, tertiary_device, positions.data,
+                                       primary_device, positions.bytes(), stream));
+        ops::gqa_attention_cached(remote_q, remote_positions, kAttnScale, cache, envelope,
+                                  *tertiary_work_, remote_output, stream);
+        CUDA_CHECK(cudaEventRecord(tertiary_ready, stream));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, tertiary_ready, 0));
+    CUDA_CHECK(cudaMemcpyPeerAsync(output.data, primary_device, remote_output.data,
+                                   tertiary_device, output.bytes(), primary_stream));
+}
+
 void TextContext::remote_gqa_kv_append(const Tensor& k, const Tensor& v,
                                        const Tensor& positions, PagedKVLayerView cache) {
     if (secondary_work_ == nullptr || !ctx_.model_parallel() || ctx_.active_rank() != 0) {
@@ -385,6 +502,43 @@ void TextContext::remote_gqa_kv_append(const Tensor& k, const Tensor& v,
         CUDA_CHECK(cudaEventRecord(secondary_ready, stream));
     }
     CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+}
+
+void TextContext::remote_gqa_kv_append_tertiary(const Tensor& k, const Tensor& v,
+                                                const Tensor& positions, PagedKVLayerView cache) {
+    if (tertiary_work_ == nullptr || !ctx_.model_parallel() || ctx_.active_rank() != 0) {
+        throw std::logic_error(
+            "tertiary remote GQA append requires primary-rank 3-way graph execution");
+    }
+    auto scope = tertiary_work_->scope();
+    Tensor remote_k =
+        tertiary_work_->alloc(k.dtype, {k.ne[0], k.ne[1], k.ne[2], k.ne[3]});
+    Tensor remote_v =
+        tertiary_work_->alloc(v.dtype, {v.ne[0], v.ne[1], v.ne[2], v.ne[3]});
+    Tensor remote_positions = tertiary_work_->alloc(
+        positions.dtype,
+        {positions.ne[0], positions.ne[1], positions.ne[2], positions.ne[3]});
+
+    const int primary_device  = ctx_.device_ids()[0];
+    const int tertiary_device = ctx_.device_ids()[2];
+    cudaStream_t primary_stream = ctx_.stream_for_rank(0);
+    cudaEvent_t primary_ready   = ctx_.fence_for_rank(0);
+    cudaEvent_t tertiary_ready  = ctx_.fence_for_rank(2);
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    {
+        ScopedDeviceRank tertiary(ctx_, 2);
+        cudaStream_t stream = ctx_.stream;
+        CUDA_CHECK(cudaStreamWaitEvent(stream, primary_ready, 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_k.data, tertiary_device, k.data, primary_device,
+                                       k.bytes(), stream));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_v.data, tertiary_device, v.data, primary_device,
+                                       v.bytes(), stream));
+        CUDA_CHECK(cudaMemcpyPeerAsync(remote_positions.data, tertiary_device, positions.data,
+                                       primary_device, positions.bytes(), stream));
+        ops::gqa_kv_append(remote_k, remote_v, remote_positions, cache, stream);
+        CUDA_CHECK(cudaEventRecord(tertiary_ready, stream));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, tertiary_ready, 0));
 }
 
 void TextContext::set_linear_state_slots(std::int32_t current_slot,
@@ -654,6 +808,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
         if (secondary_mtp_kv_.valid()) {
             remote_gqa_kv_append(kn, v, positions, secondary_mtp_kv_.layer_view(0));
+        } else if (tertiary_mtp_kv_.valid()) {
+            remote_gqa_kv_append_tertiary(kn, v, positions, tertiary_mtp_kv_.layer_view(0));
         } else {
             ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
         }
@@ -701,6 +857,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         if (secondary_mtp_kv_.valid()) {
             remote_gqa_attention_cached(qn, last_position, secondary_mtp_kv_.layer_view(0),
                                         envelope, a);
+        } else if (tertiary_mtp_kv_.valid()) {
+            remote_gqa_attention_cached_tertiary(
+                qn, last_position, tertiary_mtp_kv_.layer_view(0), envelope, a);
         } else {
             ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0),
                                       envelope, work_, a, s);
@@ -1006,11 +1165,30 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
-    const bool remote_layer = fidx >= primary_attention_layers_;
-    const auto* cache       = remote_layer ? batch_secondary_text_kv_ : batch_text_kv_;
+    // 3-way KV routing: rank 0 (local), rank 1 (secondary), rank 2 (tertiary).
+    // In 2-way mode secondary_attention_layers_ == 0, so everything past primary goes to rank 1.
+    const int secondary_end = primary_attention_layers_ + secondary_attention_layers_;
+    int kv_rank;
+    std::uint32_t cache_layer;
+    const qwen3_6::PagedKVCache* cache;
+    if (fidx < primary_attention_layers_) {
+        kv_rank     = 0;
+        cache_layer = static_cast<std::uint32_t>(fidx);
+        cache       = batch_text_kv_;
+    } else if (secondary_attention_layers_ > 0 && fidx < secondary_end) {
+        kv_rank     = 1;
+        cache_layer = static_cast<std::uint32_t>(fidx - primary_attention_layers_);
+        cache       = batch_secondary_text_kv_;
+    } else if (secondary_attention_layers_ > 0) {
+        kv_rank     = 2;
+        cache_layer = static_cast<std::uint32_t>(fidx - secondary_end);
+        cache       = batch_tertiary_text_kv_;
+    } else {
+        kv_rank     = 1;
+        cache_layer = static_cast<std::uint32_t>(fidx - primary_attention_layers_);
+        cache       = batch_secondary_text_kv_;
+    }
     if (cache == nullptr) { throw std::logic_error("Text attention KV cache is unavailable"); }
-    const std::uint32_t cache_layer = static_cast<std::uint32_t>(
-        remote_layer ? fidx - primary_attention_layers_ : fidx);
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1022,19 +1200,27 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        if (remote_layer) {
+        if (kv_rank == 1) {
             remote_gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
                                  cache->batch_layer_view(cache_layer), *active_gqa_envelope_,
                                  a_batch);
+        } else if (kv_rank == 2) {
+            remote_gqa_attention_tertiary(
+                q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+                cache->batch_layer_view(cache_layer), *active_gqa_envelope_, a_batch);
         } else {
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
                                kAttnScale, cache->batch_layer_view(cache_layer),
                                *active_gqa_envelope_, work_, a_batch, s);
         }
     } else {
-        if (remote_layer) {
+        if (kv_rank == 1) {
             remote_gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
                                  cache->batch_layer_view(cache_layer), *active_gqa_envelope_, a);
+        } else if (kv_rank == 2) {
+            remote_gqa_attention_tertiary(
+                qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+                cache->batch_layer_view(cache_layer), *active_gqa_envelope_, a);
         } else {
             ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
                                cache->batch_layer_view(cache_layer), *active_gqa_envelope_, work_,

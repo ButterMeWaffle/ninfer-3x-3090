@@ -63,7 +63,9 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
                      state.execution.secondary_work, state.execution.tertiary_work, state.secondary_text_kv,
                      state.secondary_mtp_kv, state.secondary_text_cache,
-                     state.secondary_mtp_cache, state.primary_attention_layers);
+                     state.secondary_mtp_cache, state.tertiary_text_kv, state.tertiary_mtp_kv,
+                     state.tertiary_text_cache, state.tertiary_mtp_cache,
+                     state.primary_attention_layers, state.secondary_attention_layers);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.turn_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_turn_checkpoint_hidden_output(state.turn_checkpoint_hidden);
@@ -94,7 +96,9 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
                      state.execution.secondary_work, state.execution.tertiary_work, state.secondary_text_kv,
                      state.secondary_mtp_kv, state.secondary_text_cache,
-                     state.secondary_mtp_cache, state.primary_attention_layers);
+                     state.secondary_mtp_cache, state.tertiary_text_kv, state.tertiary_mtp_kv,
+                     state.tertiary_text_cache, state.tertiary_mtp_cache,
+                     state.primary_attention_layers, state.secondary_attention_layers);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.turn_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_turn_checkpoint_hidden_output(state.turn_checkpoint_hidden);

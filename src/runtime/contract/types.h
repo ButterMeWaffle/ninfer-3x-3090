@@ -97,10 +97,14 @@ struct SequenceCapacityCurve {
     std::size_t bytes_per_additional_main_page_group = 0;
     std::size_t minimum_secondary_device_reservation_bytes     = 0;
     std::size_t secondary_bytes_per_additional_main_page_group = 0;
+    std::size_t minimum_tertiary_device_reservation_bytes      = 0;
+    std::size_t tertiary_bytes_per_additional_main_page_group  = 0;
 
     [[nodiscard]] std::size_t reservation_bytes(std::uint32_t main_page_groups) const;
     [[nodiscard]] std::size_t
     secondary_reservation_bytes(std::uint32_t main_page_groups) const;
+    [[nodiscard]] std::size_t
+    tertiary_reservation_bytes(std::uint32_t main_page_groups) const;
     [[nodiscard]] std::uint32_t resolved_tokens(std::uint32_t main_page_groups) const;
 };
 
@@ -115,13 +119,19 @@ struct KvCapacityResolution {
     std::size_t secondary_minimum_runtime_reservation_bytes    = 0;
     std::size_t secondary_bytes_per_additional_main_page_group = 0;
     std::size_t secondary_runtime_reservation_bytes            = 0;
+    std::size_t tertiary_minimum_runtime_reservation_bytes     = 0;
+    std::size_t tertiary_bytes_per_additional_main_page_group  = 0;
+    std::size_t tertiary_runtime_reservation_bytes             = 0;
     std::size_t available_after_weights_bytes        = 0;
     std::size_t available_after_startup_bytes        = 0;
     std::size_t secondary_available_after_weights_bytes = 0;
     std::size_t secondary_available_after_startup_bytes = 0;
+    std::size_t tertiary_available_after_weights_bytes  = 0;
+    std::size_t tertiary_available_after_startup_bytes  = 0;
     std::size_t automatic_headroom_bytes             = 0;
     std::size_t planned_slack_bytes                  = 0;
     std::size_t secondary_planned_slack_bytes        = 0;
+    std::size_t tertiary_planned_slack_bytes         = 0;
 };
 
 } // namespace ninfer::runtime

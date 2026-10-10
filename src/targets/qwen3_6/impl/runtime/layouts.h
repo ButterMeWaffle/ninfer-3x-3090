@@ -54,6 +54,13 @@ struct SecondaryPersistentLayout {
     std::size_t kv_payload_bytes = 0;
 };
 
+struct TertiaryPersistentLayout {
+    qwen3_6::PagedKVCacheLayout text_kv;
+    std::optional<qwen3_6::PagedKVCacheLayout> mtp_kv;
+    std::size_t bytes            = 0;
+    std::size_t kv_payload_bytes = 0;
+};
+
 struct WorkspacePlan {
     std::size_t text_prefill   = 0;
     std::size_t ordinary_round = 0;
@@ -82,6 +89,7 @@ struct SequencePlanningInputs {
     bool use_cuda_graph = true;
     bool graph_parallel = false;
     int device          = 0;
+    int device_count    = 1;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -108,13 +116,16 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     bool graph_parallel = false;
     int device          = 0;
+    int device_count    = 1;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     std::optional<NINFER_QWEN36_RUNTIME_NS::SecondaryPersistentLayout> secondary_persistent;
+    std::optional<NINFER_QWEN36_RUNTIME_NS::TertiaryPersistentLayout> tertiary_persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;
     std::size_t graph_allowance_bytes            = 0;
     std::size_t device_reservation_bytes         = 0;
     std::size_t secondary_device_reservation_bytes = 0;
+    std::size_t tertiary_device_reservation_bytes = 0;
 };
 
 template <>

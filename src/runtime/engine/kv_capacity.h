@@ -10,6 +10,8 @@ namespace ninfer::runtime {
                                                        const SequenceCapacityCurve& curve,
                                                        std::size_t available_runtime_bytes,
                                                        std::size_t secondary_available_runtime_bytes =
+                                                           0,
+                                                       std::size_t tertiary_available_runtime_bytes =
                                                            0);
 
 } // namespace ninfer::runtime

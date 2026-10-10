@@ -238,32 +238,75 @@ SecondaryPersistentLayout secondary_persistent_layout(const SequencePlanImpl& pl
         throw std::logic_error("secondary KV layout requires a valid graph attention partition");
     }
     const std::uint32_t physical_pages = plan.main_page_groups;
-    const std::uint64_t mtp_extra_pages =
-        plan.features.mtp()
-            ? static_cast<std::uint64_t>(plan.max_concurrency) *
-                  ((static_cast<std::uint64_t>(plan.draft_window - 1U) + kPagedKVPageSize - 1U) /
-                   static_cast<std::uint32_t>(kPagedKVPageSize))
-            : 0ULL;
-    const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
-        checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
-                    "secondary MTP Paged KV physical pages exceed int32"));
-    const auto table_rows = static_cast<std::int32_t>(plan.max_concurrency);
     LayoutBuilder builder;
     SecondaryPersistentLayout out;
+    const std::uint32_t secondary_layers =
+        Variant::graph_secondary_attention_layers > 0
+            ? Variant::graph_secondary_attention_layers
+            : static_cast<std::uint32_t>(TextConfig::full_attention_layers()) -
+                  Variant::graph_primary_attention_layers;
     out.text_kv = qwen3_6::plan_paged_kv_cache(
-        builder,
-        static_cast<std::uint32_t>(TextConfig::full_attention_layers()) -
-            Variant::graph_primary_attention_layers,
-        plan.capacity, TextConfig::kv_heads, TextConfig::head_dim, plan.kv_dtype,
-        plan.kv_quant_group, table_rows, physical_pages, plan.kv_packed_v, plan.kv_rotate_k,
-        plan.kv_rotate_v);
-    if (plan.features.mtp()) {
+        builder, secondary_layers, plan.capacity, TextConfig::kv_heads, TextConfig::head_dim,
+        plan.kv_dtype, plan.kv_quant_group,
+        static_cast<std::int32_t>(plan.max_concurrency), physical_pages, plan.kv_packed_v,
+        plan.kv_rotate_k, plan.kv_rotate_v);
+    const bool mtp_on_secondary =
+        plan.features.mtp() && Variant::graph_secondary_attention_layers == 0;
+    if (mtp_on_secondary) {
+        const std::uint64_t mtp_extra_pages =
+            static_cast<std::uint64_t>(plan.max_concurrency) *
+            ((static_cast<std::uint64_t>(plan.draft_window - 1U) + kPagedKVPageSize - 1U) /
+             static_cast<std::uint32_t>(kPagedKVPageSize));
+        const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
+            checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
+                        "secondary MTP Paged KV physical pages exceed int32"));
         out.mtp_kv = qwen3_6::plan_paged_kv_cache(
             builder, TextConfig::mtp_layers, plan.capacity, TextConfig::kv_heads,
-            TextConfig::head_dim, plan.kv_dtype, plan.kv_quant_group, table_rows,
-            mtp_physical_pages, plan.kv_packed_v, plan.kv_rotate_k, plan.kv_rotate_v);
+            TextConfig::head_dim, plan.kv_dtype, plan.kv_quant_group,
+            static_cast<std::int32_t>(plan.max_concurrency), mtp_physical_pages,
+            plan.kv_packed_v, plan.kv_rotate_k, plan.kv_rotate_v);
     }
     out.bytes = builder.finish(kArenaAlign, "secondary persistent layout");
+    out.kv_payload_bytes =
+        out.text_kv.payload_bytes() + (out.mtp_kv ? out.mtp_kv->payload_bytes() : 0);
+    return out;
+}
+
+TertiaryPersistentLayout tertiary_persistent_layout(const SequencePlanImpl& plan) {
+    if (!plan.graph_parallel || !Variant::supports_graph_parallel ||
+        Variant::graph_secondary_attention_layers == 0) {
+        throw std::logic_error("tertiary KV layout requires a valid 3-way graph attention partition");
+    }
+    const std::uint32_t full_layers = static_cast<std::uint32_t>(TextConfig::full_attention_layers());
+    const std::uint32_t tertiary_layers =
+        full_layers - Variant::graph_primary_attention_layers -
+        Variant::graph_secondary_attention_layers;
+    if (tertiary_layers == 0) {
+        throw std::logic_error("tertiary KV layer count is zero");
+    }
+    const std::uint32_t physical_pages = plan.main_page_groups;
+    LayoutBuilder builder;
+    TertiaryPersistentLayout out;
+    out.text_kv = qwen3_6::plan_paged_kv_cache(
+        builder, tertiary_layers, plan.capacity, TextConfig::kv_heads, TextConfig::head_dim,
+        plan.kv_dtype, plan.kv_quant_group,
+        static_cast<std::int32_t>(plan.max_concurrency), physical_pages, plan.kv_packed_v,
+        plan.kv_rotate_k, plan.kv_rotate_v);
+    if (plan.features.mtp()) {
+        const std::uint64_t mtp_extra_pages =
+            static_cast<std::uint64_t>(plan.max_concurrency) *
+            ((static_cast<std::uint64_t>(plan.draft_window - 1U) + kPagedKVPageSize - 1U) /
+             static_cast<std::uint32_t>(kPagedKVPageSize));
+        const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
+            checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
+                        "tertiary MTP Paged KV physical pages exceed int32"));
+        out.mtp_kv = qwen3_6::plan_paged_kv_cache(
+            builder, TextConfig::mtp_layers, plan.capacity, TextConfig::kv_heads,
+            TextConfig::head_dim, plan.kv_dtype, plan.kv_quant_group,
+            static_cast<std::int32_t>(plan.max_concurrency), mtp_physical_pages,
+            plan.kv_packed_v, plan.kv_rotate_k, plan.kv_rotate_v);
+    }
+    out.bytes = builder.finish(kArenaAlign, "tertiary persistent layout");
     out.kv_payload_bytes =
         out.text_kv.payload_bytes() + (out.mtp_kv ? out.mtp_kv->payload_bytes() : 0);
     return out;
@@ -668,6 +711,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->graph_parallel      = inputs.graph_parallel;
     impl->device              = inputs.device;
+    impl->device_count        = inputs.device_count;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->kv_packed_v         = inputs.kv_packed_v;
@@ -676,6 +720,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->persistent          = persistent_layout(*impl);
     if (impl->graph_parallel) {
         impl->secondary_persistent = secondary_persistent_layout(*impl);
+        if (impl->device_count > 2 && Variant::graph_secondary_attention_layers > 0) {
+            impl->tertiary_persistent = tertiary_persistent_layout(*impl);
+        }
     }
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -746,6 +793,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->secondary_persistent->bytes, impl->workspace.capacity,
             "secondary sequence memory plan");
     }
+    if (impl->tertiary_persistent) {
+        impl->tertiary_device_reservation_bytes = checked_add(
+            impl->tertiary_persistent->bytes, impl->workspace.capacity,
+            "tertiary sequence memory plan");
+    }
     return impl;
 }
 
@@ -773,6 +825,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .use_cuda_graph = options.use_cuda_graph,
         .graph_parallel = device.model_parallel(),
         .device         = options.device,
+        .device_count   = static_cast<int>(device.size()),
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
@@ -795,6 +848,9 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
           .minimum_secondary_device_reservation_bytes =
               planner->minimum->secondary_device_reservation_bytes,
           .secondary_bytes_per_additional_main_page_group = 0,
+          .minimum_tertiary_device_reservation_bytes =
+              planner->minimum->tertiary_device_reservation_bytes,
+          .tertiary_bytes_per_additional_main_page_group = 0,
     };
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
@@ -812,6 +868,16 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
             planner->curve.secondary_bytes_per_additional_main_page_group =
                 adjacent->secondary_device_reservation_bytes -
                 planner->minimum->secondary_device_reservation_bytes;
+            if (adjacent->tertiary_device_reservation_bytes > 0) {
+                if (adjacent->tertiary_device_reservation_bytes <=
+                    planner->minimum->tertiary_device_reservation_bytes) {
+                    throw std::logic_error(
+                        "Qwen3.6 tertiary sequence layout has a nonpositive KV capacity stride");
+                }
+                planner->curve.tertiary_bytes_per_additional_main_page_group =
+                    adjacent->tertiary_device_reservation_bytes -
+                    planner->minimum->tertiary_device_reservation_bytes;
+            }
         }
     }
     return planner;
@@ -826,6 +892,8 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl
     const std::size_t expected = planner->curve.reservation_bytes(main_page_groups);
     const std::size_t secondary_expected =
         planner->curve.secondary_reservation_bytes(main_page_groups);
+    const std::size_t tertiary_expected =
+        planner->curve.tertiary_reservation_bytes(main_page_groups);
     std::unique_ptr<SequencePlanImpl> plan;
     if (main_page_groups == planner->curve.minimum_main_page_groups) {
         plan = std::move(planner->minimum);
@@ -839,6 +907,10 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl
     if (plan->secondary_device_reservation_bytes != secondary_expected) {
         throw std::logic_error(
             "Qwen3.6 secondary physical sequence layout is not affine in Main KV page capacity");
+    }
+    if (plan->tertiary_device_reservation_bytes != tertiary_expected) {
+        throw std::logic_error(
+            "Qwen3.6 tertiary physical sequence layout is not affine in Main KV page capacity");
     }
     return plan;
 }

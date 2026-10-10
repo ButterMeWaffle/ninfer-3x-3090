@@ -37,6 +37,7 @@ struct Variant {
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr bool supports_graph_parallel              = true;
     static constexpr std::uint32_t graph_primary_attention_layers = 5;
+    static constexpr std::uint32_t graph_secondary_attention_layers = 6;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
     static void attention_projection(const Tensor& hidden,

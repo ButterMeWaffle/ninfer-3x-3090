@@ -49,11 +49,16 @@ struct PrefillContext {
     qwen3_6::PagedKVCacheView mtp_kv;
     qwen3_6::PagedKVCacheView secondary_text_kv;
     qwen3_6::PagedKVCacheView secondary_mtp_kv;
+    qwen3_6::PagedKVCacheView tertiary_text_kv;
+    qwen3_6::PagedKVCacheView tertiary_mtp_kv;
     const qwen3_6::PagedKVCache& text_cache;
     const qwen3_6::PagedKVCache* mtp_cache;
     const qwen3_6::PagedKVCache* secondary_text_cache;
     const qwen3_6::PagedKVCache* secondary_mtp_cache;
+    const qwen3_6::PagedKVCache* tertiary_text_cache;
+    const qwen3_6::PagedKVCache* tertiary_mtp_cache;
     std::int32_t primary_attention_layers;
+    std::int32_t secondary_attention_layers;
     DFlashPersistentState* dflash;
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
@@ -68,7 +73,9 @@ struct OrdinaryBatchContext {
     ExecutionCore execution;
     const qwen3_6::PagedKVCache& text_cache;
     const qwen3_6::PagedKVCache* secondary_text_cache;
+    const qwen3_6::PagedKVCache* tertiary_text_cache;
     std::int32_t primary_attention_layers;
+    std::int32_t secondary_attention_layers;
     qwen3_6::OrdinaryDecodeState& frame;
     const qwen3_6::OrdinaryDecodeIngress& host_ingress;
     qwen3_6::OrdinaryDecodeEgress& host_egress;
@@ -81,7 +88,10 @@ struct MtpBatchContext {
     const qwen3_6::PagedKVCache* mtp_cache;
     const qwen3_6::PagedKVCache* secondary_text_cache;
     const qwen3_6::PagedKVCache* secondary_mtp_cache;
+    const qwen3_6::PagedKVCache* tertiary_text_cache;
+    const qwen3_6::PagedKVCache* tertiary_mtp_cache;
     std::int32_t primary_attention_layers;
+    std::int32_t secondary_attention_layers;
     qwen3_6::MtpDecodeState& frame;
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
@@ -92,7 +102,9 @@ struct DFlashBatchContext {
     ExecutionCore execution;
     const qwen3_6::PagedKVCache& text_cache;
     const qwen3_6::PagedKVCache* secondary_text_cache;
+    const qwen3_6::PagedKVCache* tertiary_text_cache;
     std::int32_t primary_attention_layers;
+    std::int32_t secondary_attention_layers;
     DFlashPersistentState& dflash;
     qwen3_6::DFlashDecodeState& frame;
     const qwen3_6::DFlashDecodeIngress& host_ingress;

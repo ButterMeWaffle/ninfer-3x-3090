@@ -25,7 +25,9 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, nullptr, state.execution.secondary_work, state.execution.tertiary_work, {}, {},
-                         state.secondary_text_cache, nullptr, state.primary_attention_layers);
+                         state.secondary_text_cache, nullptr, {}, {},
+                         state.tertiary_text_cache, nullptr, state.primary_attention_layers,
+                         state.secondary_attention_layers);
 
         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions = ordinary.cache_positions.slice(0, 0, batch_size);

@@ -39,6 +39,15 @@ void validate_curve(const SequenceCapacityCurve& curve) {
         curve.secondary_bytes_per_additional_main_page_group == 0) {
         throw std::invalid_argument("expandable secondary sequence capacity curve has zero byte stride");
     }
+    if (curve.minimum_tertiary_device_reservation_bytes == 0 &&
+        curve.tertiary_bytes_per_additional_main_page_group != 0) {
+        throw std::invalid_argument("tertiary sequence capacity curve has no minimum reservation");
+    }
+    if (curve.minimum_tertiary_device_reservation_bytes != 0 &&
+        curve.minimum_main_page_groups < curve.maximum_main_page_groups &&
+        curve.tertiary_bytes_per_additional_main_page_group == 0) {
+        throw std::invalid_argument("expandable tertiary sequence capacity curve has zero byte stride");
+    }
 }
 
 std::uint32_t fitting_pages(std::size_t budget, std::size_t minimum_bytes,
@@ -105,6 +114,23 @@ SequenceCapacityCurve::secondary_reservation_bytes(std::uint32_t main_page_group
         "secondary sequence capacity reservation overflows size_t");
 }
 
+std::size_t
+SequenceCapacityCurve::tertiary_reservation_bytes(std::uint32_t main_page_groups) const {
+    validate_curve(*this);
+    if (main_page_groups < minimum_main_page_groups ||
+        main_page_groups > maximum_main_page_groups) {
+        throw std::invalid_argument("Main KV page count is outside the target capacity curve");
+    }
+    if (minimum_tertiary_device_reservation_bytes == 0) { return 0; }
+    const std::size_t additional =
+        static_cast<std::size_t>(main_page_groups - minimum_main_page_groups);
+    return checked_add(
+        minimum_tertiary_device_reservation_bytes,
+        checked_mul(additional, tertiary_bytes_per_additional_main_page_group,
+                    "tertiary sequence capacity increment overflows size_t"),
+        "tertiary sequence capacity reservation overflows size_t");
+}
+
 std::uint32_t SequenceCapacityCurve::resolved_tokens(std::uint32_t main_page_groups) const {
     validate_curve(*this);
     if (main_page_groups < minimum_main_page_groups ||
@@ -121,13 +147,16 @@ std::uint32_t SequenceCapacityCurve::resolved_tokens(std::uint32_t main_page_gro
 KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                                          const SequenceCapacityCurve& curve,
                                          std::size_t available_runtime_bytes,
-                                         std::size_t secondary_available_runtime_bytes) {
+                                         std::size_t secondary_available_runtime_bytes,
+                                         std::size_t tertiary_available_runtime_bytes) {
     validate_curve(curve);
 
     const bool has_secondary = curve.minimum_secondary_device_reservation_bytes != 0;
+    const bool has_tertiary  = curve.minimum_tertiary_device_reservation_bytes != 0;
     std::uint32_t pages                = curve.minimum_main_page_groups;
     std::size_t capacity_budget        = available_runtime_bytes;
     std::size_t secondary_budget       = secondary_available_runtime_bytes;
+    std::size_t tertiary_budget        = tertiary_available_runtime_bytes;
     switch (policy.mode) {
     case KvCapacityMode::Explicit:
         if (policy.automatic_headroom_bytes != 0) {
@@ -139,8 +168,9 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         if (available_runtime_bytes < policy.automatic_headroom_bytes) {
             throw std::invalid_argument(
                 "automatic KV headroom requires " +
-                std::to_string(policy.automatic_headroom_bytes) + " bytes, but only " +
-                std::to_string(available_runtime_bytes) + " bytes are available after weights");
+                std::to_string(policy.automatic_headroom_bytes) +
+                " bytes, but only " + std::to_string(available_runtime_bytes) +
+                " bytes are available after weights");
         }
         capacity_budget -= policy.automatic_headroom_bytes;
         if (has_secondary) {
@@ -149,6 +179,13 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                     "secondary automatic KV headroom exceeds memory available after weights");
             }
             secondary_budget -= policy.automatic_headroom_bytes;
+        }
+        if (has_tertiary) {
+            if (tertiary_available_runtime_bytes < policy.automatic_headroom_bytes) {
+                throw std::invalid_argument(
+                    "tertiary automatic KV headroom exceeds memory available after weights");
+            }
+            tertiary_budget -= policy.automatic_headroom_bytes;
         }
         pages = fitting_pages(capacity_budget, curve.minimum_device_reservation_bytes,
                               curve.bytes_per_additional_main_page_group, curve, "primary");
@@ -160,6 +197,14 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                               curve.secondary_bytes_per_additional_main_page_group, curve,
                               "secondary"));
         }
+        if (has_tertiary) {
+            pages = std::min(
+                pages,
+                fitting_pages(tertiary_budget,
+                              curve.minimum_tertiary_device_reservation_bytes,
+                              curve.tertiary_bytes_per_additional_main_page_group, curve,
+                              "tertiary"));
+        }
         break;
     default:
         throw std::invalid_argument("unknown KV capacity policy");
@@ -168,15 +213,22 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
     const std::size_t reservation = curve.reservation_bytes(pages);
     if (reservation > capacity_budget) {
         throw std::invalid_argument("requested Engine runtime reservation requires " +
-                                    std::to_string(reservation) + " bytes, but only " +
-                                    std::to_string(capacity_budget) +
+                                    std::to_string(reservation) +
+                                    " bytes, but only " + std::to_string(capacity_budget) +
                                     " bytes are available for runtime capacity");
     }
     const std::size_t secondary_reservation = curve.secondary_reservation_bytes(pages);
     if (secondary_reservation > secondary_budget) {
         throw std::invalid_argument("requested secondary Engine runtime reservation requires " +
-                                    std::to_string(secondary_reservation) + " bytes, but only " +
-                                    std::to_string(secondary_budget) +
+                                    std::to_string(secondary_reservation) +
+                                    " bytes, but only " + std::to_string(secondary_budget) +
+                                    " bytes are available for runtime capacity");
+    }
+    const std::size_t tertiary_reservation = curve.tertiary_reservation_bytes(pages);
+    if (tertiary_reservation > tertiary_budget) {
+        throw std::invalid_argument("requested tertiary Engine runtime reservation requires " +
+                                    std::to_string(tertiary_reservation) +
+                                    " bytes, but only " + std::to_string(tertiary_budget) +
                                     " bytes are available for runtime capacity");
     }
 
@@ -193,12 +245,20 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         .secondary_bytes_per_additional_main_page_group =
             curve.secondary_bytes_per_additional_main_page_group,
         .secondary_runtime_reservation_bytes = secondary_reservation,
+        .tertiary_minimum_runtime_reservation_bytes =
+            curve.minimum_tertiary_device_reservation_bytes,
+        .tertiary_bytes_per_additional_main_page_group =
+            curve.tertiary_bytes_per_additional_main_page_group,
+        .tertiary_runtime_reservation_bytes = tertiary_reservation,
         .available_after_weights_bytes        = available_runtime_bytes,
         .secondary_available_after_weights_bytes = secondary_available_runtime_bytes,
+        .tertiary_available_after_weights_bytes  = tertiary_available_runtime_bytes,
         .automatic_headroom_bytes             = policy.automatic_headroom_bytes,
         .planned_slack_bytes                  = available_runtime_bytes - reservation,
         .secondary_planned_slack_bytes =
             has_secondary ? secondary_available_runtime_bytes - secondary_reservation : 0,
+        .tertiary_planned_slack_bytes =
+            has_tertiary ? tertiary_available_runtime_bytes - tertiary_reservation : 0,
     };
 }
 

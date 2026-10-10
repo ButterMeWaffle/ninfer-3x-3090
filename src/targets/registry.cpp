@@ -84,6 +84,7 @@ void require_load_capacity(const DeviceContext& device, std::size_t rank,
 struct RuntimeAvailability {
     std::size_t primary   = 0;
     std::size_t secondary = 0;
+    std::size_t tertiary  = 0;
 };
 
 RuntimeAvailability runtime_bytes_after_planned_weights(
@@ -112,6 +113,13 @@ RuntimeAvailability runtime_bytes_after_planned_weights(
         require_load_capacity(device, 1, secondary_peak, secondary_free);
         available.secondary =
             secondary_free - static_cast<std::size_t>(plan.secondary_device_capacity_bytes);
+
+        if (device.device_ids().size() >= 3) {
+            const std::size_t tertiary_free = free_device_bytes(device, 2);
+            require_load_capacity(device, 2, plan.tertiary_device_capacity_bytes, tertiary_free);
+            available.tertiary =
+                tertiary_free - static_cast<std::size_t>(plan.tertiary_device_capacity_bytes);
+        }
     }
 
     return available;
@@ -132,7 +140,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const RuntimeAvailability preflight_runtime =
         runtime_bytes_after_planned_weights(load_plan.materialization(), device);
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime.primary,
-                                       preflight_runtime.secondary);
+                                       preflight_runtime.secondary, preflight_runtime.tertiary);
 
     auto progress     = artifact_progress(options.load_progress);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
@@ -144,13 +152,19 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const RuntimeAvailability current_runtime{
         .primary   = free_device_bytes(device, 0),
         .secondary = device.model_parallel() ? free_device_bytes(device, 1) : 0,
+        .tertiary  = device.model_parallel() && device.device_ids().size() >= 3
+                         ? free_device_bytes(device, 2)
+                         : 0,
     };
     runtime::KvCapacityResolution capacity_resolution = runtime::resolve_kv_capacity(
-        options.kv_capacity, curve, current_runtime.primary, current_runtime.secondary);
+        options.kv_capacity, curve, current_runtime.primary, current_runtime.secondary,
+        current_runtime.tertiary);
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
         sequence_plan.secondary_device_reservation_bytes() !=
             capacity_resolution.secondary_runtime_reservation_bytes ||
+        (sequence_plan.tertiary_device_reservation_bytes() !=
+         capacity_resolution.tertiary_runtime_reservation_bytes) ||
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
@@ -162,6 +176,10 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     if (device.model_parallel()) {
         instance->kv_capacity_resolution.secondary_available_after_startup_bytes =
             free_device_bytes(device, 1);
+        if (device.device_ids().size() >= 3) {
+            instance->kv_capacity_resolution.tertiary_available_after_startup_bytes =
+                free_device_bytes(device, 2);
+        }
     }
 
     LoadSummary summary;

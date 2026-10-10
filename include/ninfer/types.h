@@ -403,11 +403,18 @@ struct MemorySummary {
     std::size_t secondary_available_after_weights_bytes     = 0;
     std::size_t secondary_available_after_startup_bytes     = 0;
     std::size_t secondary_planned_slack_bytes               = 0;
+    std::size_t tertiary_minimum_runtime_reservation_bytes  = 0;
+    std::size_t tertiary_kv_capacity_increment_bytes        = 0;
+    std::size_t tertiary_runtime_reservation_bytes          = 0;
+    std::size_t tertiary_available_after_weights_bytes      = 0;
+    std::size_t tertiary_available_after_startup_bytes      = 0;
+    std::size_t tertiary_planned_slack_bytes                = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
     std::size_t secondary_kv_payload_bytes        = 0;
+    std::size_t tertiary_kv_payload_bytes         = 0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
