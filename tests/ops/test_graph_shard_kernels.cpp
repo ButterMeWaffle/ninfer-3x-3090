@@ -229,9 +229,19 @@ int main() {
         int failures = verify_q4_shard(0, 8192, full_q4);
         failures += verify_q4_shard(8192, 9216, full_q4);
 
+        // 3-way: 6144 / 6144 / 5120
+        failures += verify_q4_shard(0, 6144, full_q4);
+        failures += verify_q4_shard(6144, 6144, full_q4);
+        failures += verify_q4_shard(12288, 5120, full_q4);
+
         const PackedRows full_q5 = make_q5_down(17408, 0);
         failures += verify_q5_shard(0, 8192, full_q5);
         failures += verify_q5_shard(8192, 9216, full_q5);
+
+        // 3-way: 6144 / 6144 / 5120
+        failures += verify_q5_shard(0, 6144, full_q5);
+        failures += verify_q5_shard(6144, 6144, full_q5);
+        failures += verify_q5_shard(12288, 5120, full_q5);
         std::cout << (failures == 0 ? "OK" : "FAIL")
                   << " compact graph-shard kernels\n";
         return failures == 0 ? 0 : 1;

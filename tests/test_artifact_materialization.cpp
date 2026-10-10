@@ -142,6 +142,31 @@ std::vector<int> find_peer_pair(int count) {
     return {};
 }
 
+std::vector<int> find_peer_set(int count, int wanted) {
+    std::vector<int> chosen;
+    for (int id = 0; id < count && static_cast<int>(chosen.size()) < wanted; ++id) {
+        if (std::find(chosen.begin(), chosen.end(), id) != chosen.end()) { continue; }
+        cudaDeviceProp properties{};
+        CUDA_CHECK(cudaGetDeviceProperties(&properties, id));
+        bool fits = true;
+        for (const int peer : chosen) {
+            cudaDeviceProp peer_properties{};
+            CUDA_CHECK(cudaGetDeviceProperties(&peer_properties, peer));
+            int id_to_peer = 0;
+            int peer_to_id = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&id_to_peer, id, peer));
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&peer_to_id, peer, id));
+            if (id_to_peer == 0 || peer_to_id == 0 || properties.major != peer_properties.major ||
+                properties.minor != peer_properties.minor) {
+                fits = false;
+                break;
+            }
+        }
+        if (fits) { chosen.push_back(id); }
+    }
+    return chosen.size() == static_cast<std::size_t>(wanted) ? chosen : std::vector<int>{};
+}
+
 std::vector<std::byte> copy_device_bytes(const void* source, std::size_t bytes) {
     std::vector<std::byte> out(bytes);
     CUDA_CHECK(cudaMemcpy(out.data(), source, bytes, cudaMemcpyDeviceToHost));
@@ -376,6 +401,100 @@ int main() {
             require_row_split_region(secondary_down, compact_down_geometry, 0, down_source,
                                      source_down_geometry, 0, 2, 4, 2,
                                      "secondary compact down columns differ from the artifact");
+        }
+
+        // 3-way: 3-GPU row-split sharding (2/2/2 paired rows, 128/128/256 columns)
+        const std::vector<int> peer_triple = find_peer_set(device_count, 3);
+        if (!peer_triple.empty()) {
+            ninfer::DeviceContext triple{std::span<const int>(peer_triple)};
+            auto shard_fixture3 = write_shard_fixture();
+            ninfer::artifact::Reader shard_reader3(shard_fixture3.path);
+            ninfer::artifact::Binder shard_binder3(shard_reader3);
+            constexpr std::array<std::uint64_t, 2> gate_shape = {8, 128};
+            constexpr std::array<std::uint64_t, 2> down_shape = {4, 256};
+            const auto gate3 = shard_binder3.require_tensor(
+                "weights/gate_up", ninfer::artifact::NumericFormat::Q4G64_F16S,
+                ninfer::artifact::StorageLayout::RowSplitK128V1, gate_shape);
+            shard_binder3.materialize_on_device(gate3);
+            // 3-way paired rows: 2/2/2
+            shard_binder3.shard_row_split_across_devices(
+                gate3, ninfer::artifact::RowSplitShardAxis::PairedRows,
+                std::span<const std::uint64_t>{2, 4});
+            const auto down3 = shard_binder3.require_tensor(
+                "weights/down", ninfer::artifact::NumericFormat::Q5G64_F16S,
+                ninfer::artifact::StorageLayout::RowSplitK128V1, down_shape);
+            shard_binder3.materialize_on_device(down3);
+            // 3-way columns: 128/128/256
+            shard_binder3.shard_row_split_across_devices(
+                down3, ninfer::artifact::RowSplitShardAxis::Columns,
+                std::span<const std::uint64_t>{128, 256});
+            const auto shard_plan3 = shard_binder3.finish();
+            require(shard_plan3.row_split_shards.size() == 2 &&
+                        shard_plan3.tertiary_device_capacity_bytes > 0,
+                    "3-way binder did not produce a tertiary device arena");
+
+            auto sharded3 = ninfer::artifact::materialize(shard_reader3, shard_plan3, triple);
+            require(sharded3.device_arena_count() == 3 &&
+                        sharded3.has_device_data(gate3, 1) && sharded3.has_device_data(gate3, 2) &&
+                        sharded3.has_device_data(down3, 1) && sharded3.has_device_data(down3, 2),
+                    "3-way cross-device compact arenas missing rank data");
+
+            // Compute compact shard byte sizes from geometry
+            constexpr std::array<std::uint64_t, 2> compact_gate_shape = {4, 128};
+            const auto compact_gate_geometry = ninfer::artifact::row_split_geometry(
+                ninfer::artifact::NumericFormat::Q4G64_F16S, compact_gate_shape);
+            const std::size_t compact_gate_bytes =
+                static_cast<std::size_t>(compact_gate_geometry.encoded_bytes);
+            const auto source_gate_geometry = ninfer::artifact::row_split_geometry(
+                ninfer::artifact::NumericFormat::Q4G64_F16S, gate_shape);
+            const auto gate_payload3 = shard_reader3.payload(shard_reader3.objects().at(gate3.index));
+            const std::vector<std::byte> gate_source3(gate_payload3.data.begin(),
+                                                      gate_payload3.data.end());
+
+            for (int rank = 0; rank < 3; ++rank) {
+                std::vector<std::byte> rank_gate;
+                {
+                    ninfer::ScopedDeviceRank r(triple, rank);
+                    rank_gate = copy_device_bytes(sharded3.device_data(gate3, rank),
+                                                  compact_gate_bytes);
+                }
+                require_row_split_region(rank_gate, compact_gate_geometry, 0, gate_source3,
+                                         source_gate_geometry, rank * 2, 0, 2, 2,
+                                         "3-way compact gate rows differ from the artifact");
+                require_row_split_region(rank_gate, compact_gate_geometry, 2, gate_source3,
+                                         source_gate_geometry, rank * 2 + 2, 0, 2, 2,
+                                         "3-way compact up rows differ from the artifact");
+            }
+
+            // Verify each rank's down shard: 128/128/256 columns
+            constexpr std::array<std::uint64_t, 2> compact_down_2col_shape = {4, 128};
+            constexpr std::array<std::uint64_t, 2> compact_down_4col_shape = {4, 256};
+            const auto compact_down_2col_geometry = ninfer::artifact::row_split_geometry(
+                ninfer::artifact::NumericFormat::Q5G64_F16S, compact_down_2col_shape);
+            const auto compact_down_4col_geometry = ninfer::artifact::row_split_geometry(
+                ninfer::artifact::NumericFormat::Q5G64_F16S, compact_down_4col_shape);
+            const auto source_down_geometry = ninfer::artifact::row_split_geometry(
+                ninfer::artifact::NumericFormat::Q5G64_F16S, down_shape);
+            const auto down_payload3 = shard_reader3.payload(shard_reader3.objects().at(down3.index));
+            const std::vector<std::byte> down_source3(down_payload3.data.begin(),
+                                                      down_payload3.data.end());
+
+            for (int rank = 0; rank < 3; ++rank) {
+                const auto& compact_geom = (rank < 2) ? compact_down_2col_geometry
+                                                      : compact_down_4col_geometry;
+                const std::size_t down_bytes =
+                    static_cast<std::size_t>(compact_geom.encoded_bytes);
+                std::vector<std::byte> rank_down;
+                {
+                    ninfer::ScopedDeviceRank r(triple, rank);
+                    rank_down = copy_device_bytes(sharded3.device_data(down3, rank), down_bytes);
+                }
+                const std::uint64_t col_begin = (rank == 0) ? 0 : (rank == 1) ? 128 : 256;
+                const std::uint64_t col_groups = (rank < 2) ? 2 : 4;
+                require_row_split_region(rank_down, compact_geom, 0, down_source3,
+                                         source_down_geometry, 0, col_begin, 4, col_groups,
+                                         "3-way compact down columns differ from the artifact");
+            }
         }
         return 0;
     } catch (const std::exception& error) {

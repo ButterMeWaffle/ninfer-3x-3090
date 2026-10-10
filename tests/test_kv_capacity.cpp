@@ -85,6 +85,44 @@ int main() {
     failures += check(insufficient_secondary_rejected,
                       "explicit KV capacity accepted an undersized secondary pool");
 
+    // 3-way: primary + secondary + tertiary pools (5/6/5 KV layer split)
+    const ninfer::runtime::SequenceCapacityCurve triple_curve{
+        .main_page_tokens                                = 64,
+        .minimum_main_page_groups                        = 2,
+        .maximum_main_page_groups                        = 6,
+        .minimum_device_reservation_bytes                = 1000,
+        .bytes_per_additional_main_page_group            = 128,
+        .minimum_secondary_device_reservation_bytes      = 600,
+        .secondary_bytes_per_additional_main_page_group  = 256,
+        .minimum_tertiary_device_reservation_bytes       = 500,
+        .tertiary_bytes_per_additional_main_page_group   = 200,
+    };
+    const auto triple = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(50), triple_curve, 1360, 1200, 1100);
+    failures += check(
+        triple.main_page_groups == 4 && triple.resolved_tokens == 256 &&
+            triple.runtime_reservation_bytes == 1256 &&
+            triple.secondary_runtime_reservation_bytes == 1112 &&
+            triple.tertiary_runtime_reservation_bytes == 932 &&
+            triple.tertiary_available_after_weights_bytes == 1100 &&
+            triple.tertiary_planned_slack_bytes == 168,
+        "3-way automatic KV capacity did not enforce all three device curves");
+
+    // Tertiary-limited: tertiary pool is the bottleneck
+    const auto triple_limited = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(50), triple_curve, 1360, 1200, 900);
+    failures += check(triple_limited.main_page_groups == 3 &&
+                          triple_limited.tertiary_runtime_reservation_bytes == 732,
+                      "3-way KV capacity did not honor the limiting tertiary pool");
+
+    bool insufficient_tertiary_rejected = false;
+    try {
+        (void)ninfer::runtime::resolve_kv_capacity(
+            ninfer::KvCapacityPolicy::explicit_capacity(129), triple_curve, 1200, 1100, 655);
+    } catch (const std::invalid_argument&) { insufficient_tertiary_rejected = true; }
+    failures += check(insufficient_tertiary_rejected,
+                      "explicit KV capacity accepted an undersized tertiary pool");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
