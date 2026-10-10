@@ -116,7 +116,8 @@ void q5_linear_graph_partial_mma_launch(const Tensor& x, const Weight& w,
     constexpr std::int32_t kParentK = 17408;
     const bool full_parent = w.k == kParentK && w.padded_shape[1] == kParentK &&
                              input_row_begin + x.ne[0] <= kParentK;
-    const bool compact = (w.k == 8192 || w.k == 9216) && w.padded_shape[1] == w.k &&
+    const bool compact = (w.k == 8192 || w.k == 9216 || w.k == 6144 || w.k == 5120) &&
+                         w.padded_shape[1] == w.k &&
                          x.ne[0] == w.k && input_row_begin == 0;
     if (w.n != 5120 || (!full_parent && !compact) || x.ne[1] <= 1 ||
         out.ne[0] != 5120 || out.ne[1] != x.ne[1] || input_row_begin < 0 || x.ne[0] <= 0 ||

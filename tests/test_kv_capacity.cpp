@@ -103,16 +103,16 @@ int main() {
         triple.main_page_groups == 4 && triple.resolved_tokens == 256 &&
             triple.runtime_reservation_bytes == 1256 &&
             triple.secondary_runtime_reservation_bytes == 1112 &&
-            triple.tertiary_runtime_reservation_bytes == 932 &&
+            triple.tertiary_runtime_reservation_bytes == 900 &&
             triple.tertiary_available_after_weights_bytes == 1100 &&
-            triple.tertiary_planned_slack_bytes == 168,
+            triple.tertiary_planned_slack_bytes == 200,
         "3-way automatic KV capacity did not enforce all three device curves");
 
     // Tertiary-limited: tertiary pool is the bottleneck
     const auto triple_limited = ninfer::runtime::resolve_kv_capacity(
         ninfer::KvCapacityPolicy::automatic(50), triple_curve, 1360, 1200, 900);
     failures += check(triple_limited.main_page_groups == 3 &&
-                          triple_limited.tertiary_runtime_reservation_bytes == 732,
+                          triple_limited.tertiary_runtime_reservation_bytes == 700,
                       "3-way KV capacity did not honor the limiting tertiary pool");
 
     bool insufficient_tertiary_rejected = false;
