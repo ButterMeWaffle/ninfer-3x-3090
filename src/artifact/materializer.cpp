@@ -537,7 +537,9 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                 const RowSplitShardMaterialization* shard =
                     find_row_split_shard(plan, placement.object);
                 if (shard == nullptr) {
-                    // Non-sharded: replicate to each secondary.
+                    // Non-sharded: replicate to the staging arena on the secondary.
+                    // The tertiary does not need non-sharded weights — only the
+                    // sharded (MLP) tensors are accessed from ranks 1 and 2.
                     CUDA_CHECK(cudaMemcpyPeerAsync(
                         primary_storage.data, secondary_device,
                         out.objects_.at(placement.object.index).device[0], primary_device,
@@ -545,15 +547,6 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                     out.stats_.peer_to_peer_bytes = checked_add(
                         out.stats_.peer_to_peer_bytes, placement.bytes,
                         "peer copied byte count overflows u64");
-                    if (device.size() > 2) {
-                        CUDA_CHECK(cudaMemcpyPeerAsync(
-                            out.objects_.at(placement.object.index).device[2], tertiary_device,
-                            out.objects_.at(placement.object.index).device[0], primary_device,
-                            static_cast<std::size_t>(placement.bytes), device.stream));
-                        out.stats_.peer_to_peer_bytes = checked_add(
-                            out.stats_.peer_to_peer_bytes, placement.bytes,
-                            "peer copied byte count overflows u64");
-                    }
                     continue;
                 }
 
