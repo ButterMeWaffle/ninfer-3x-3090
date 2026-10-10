@@ -686,9 +686,14 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
-    const bool remote_cache = batch_secondary_mtp_kv_ != nullptr;
-    const auto* cache       = remote_cache ? batch_secondary_mtp_kv_ : batch_mtp_kv_;
-    if (cache == nullptr) { throw std::logic_error("MTP attention KV cache is unavailable"); }
+    const int mtp_kv_rank = batch_mtp_kv_ != nullptr            ? 0
+                        : batch_secondary_mtp_kv_ != nullptr    ? 1
+                        : batch_tertiary_mtp_kv_ != nullptr     ? 2
+                                                                 : -1;
+    if (mtp_kv_rank < 0) { throw std::logic_error("MTP attention KV cache is unavailable"); }
+    const auto* cache = mtp_kv_rank == 0    ? batch_mtp_kv_
+                      : mtp_kv_rank == 1    ? batch_secondary_mtp_kv_
+                                            : batch_tertiary_mtp_kv_;
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T ||
@@ -700,19 +705,26 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
-        if (remote_cache) {
+        if (mtp_kv_rank == 1) {
             remote_gqa_attention(q_batch, k_batch, v_batch, position_batch,
                                  *active_valid_columns_, *active_backend_kv_table_rows_,
                                  cache->batch_layer_view(0), envelope, a_batch);
+        } else if (mtp_kv_rank == 2) {
+            remote_gqa_attention_tertiary(q_batch, k_batch, v_batch, position_batch,
+                                          *active_valid_columns_, *active_backend_kv_table_rows_,
+                                          cache->batch_layer_view(0), envelope, a_batch);
         } else {
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch,
                                *active_valid_columns_, *active_backend_kv_table_rows_, kAttnScale,
                                cache->batch_layer_view(0), envelope, work_, a_batch, s);
         }
     } else {
-        if (remote_cache) {
+        if (mtp_kv_rank == 1) {
             remote_gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
                                  cache->batch_layer_view(0), envelope, a);
+        } else if (mtp_kv_rank == 2) {
+            remote_gqa_attention_tertiary(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
+                                          cache->batch_layer_view(0), envelope, a);
         } else {
             ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
                                kAttnScale, cache->batch_layer_view(0), envelope, work_, a, s);
@@ -740,7 +752,8 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                                    const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                                    Tensor& mtp_hidden, const Tensor* input_embeddings) {
-    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr) {
+    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr &&
+        batch_tertiary_mtp_kv_ == nullptr) {
         throw std::runtime_error("MTP forward is not enabled");
     }
     auto scratch_scope = work_.scope();
@@ -755,7 +768,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& rope_positions,
                                     ops::GqaExecutionEnvelope envelope, bool final_chunk,
                                     Tensor* final_hidden, Tensor* logits, Tensor* draft_token) {
-    if (!mtp_kv_.valid() && !secondary_mtp_kv_.valid()) {
+    if (!mtp_kv_.valid() && !secondary_mtp_kv_.valid() && !tertiary_mtp_kv_.valid()) {
         throw std::runtime_error("MTP prefill is not enabled");
     }
     const int T = ids.ne[0];
@@ -904,7 +917,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     Tensor& mtp_hidden, int logits_column, Tensor* logits,
                                     Tensor* draft_token, const Tensor* explicit_rope_positions,
                                     const Tensor* input_embeddings) {
-    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr) {
+    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr &&
+        batch_tertiary_mtp_kv_ == nullptr) {
         throw std::runtime_error("MTP forward is not enabled");
     }
     const int T = ids.ne[0];
@@ -950,7 +964,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
 void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                                       const Tensor& position, ops::GqaExecutionEnvelope envelope,
                                       Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token) {
-    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr) {
+    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr &&
+        batch_tertiary_mtp_kv_ == nullptr) {
         throw std::runtime_error("MTP forward is not enabled");
     }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
@@ -1092,7 +1107,8 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden) {
-    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr) {
+    if (batch_mtp_kv_ == nullptr && batch_secondary_mtp_kv_ == nullptr &&
+        batch_tertiary_mtp_kv_ == nullptr) {
         throw std::runtime_error("MTP forward is not enabled");
     }
     const std::int32_t width = ids.ne[0];

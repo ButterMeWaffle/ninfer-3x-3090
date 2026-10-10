@@ -1266,6 +1266,7 @@ void ProgramImplCore::prepare_graphs() {
     std::vector<PagedKVAllocation> mtp_capture_allocations;
     std::vector<PagedKVAllocation> secondary_text_capture_allocations;
     std::vector<PagedKVAllocation> secondary_mtp_capture_allocations;
+    std::vector<PagedKVAllocation> tertiary_mtp_capture_allocations;
     std::vector<PagedKVAllocation> dflash_capture_allocations;
     const auto reserve_capture_rows = [&](qwen3_6::PagedKVCache& cache,
                                           std::vector<PagedKVAllocation>& allocations,
@@ -1303,6 +1304,10 @@ void ProgramImplCore::prepare_graphs() {
             ScopedDeviceRank secondary(device, 1);
             reserve_capture_rows(*secondary_mtp_kv, secondary_mtp_capture_allocations,
                                  "secondary MTP KV cache");
+        } else if (backend_kv_on_tertiary()) {
+            ScopedDeviceRank tertiary(device, 2);
+            reserve_capture_rows(*tertiary_mtp_kv, tertiary_mtp_capture_allocations,
+                                 "tertiary MTP KV cache");
         } else {
             reserve_capture_rows(*decoder->mtp_cache(), mtp_capture_allocations, "MTP KV cache");
         }
@@ -1367,6 +1372,9 @@ void ProgramImplCore::prepare_graphs() {
         if (backend_kv_on_secondary()) {
             ScopedDeviceRank secondary(device, 1);
             zero_capture_pages(*secondary_mtp_kv, secondary_mtp_capture_allocations, batch_size);
+        } else if (backend_kv_on_tertiary()) {
+            ScopedDeviceRank tertiary(device, 2);
+            zero_capture_pages(*tertiary_mtp_kv, tertiary_mtp_capture_allocations, batch_size);
         } else if (decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), mtp_capture_allocations, batch_size);
         }
@@ -1640,6 +1648,10 @@ void ProgramImplCore::prepare_graphs() {
         allocation.unbind_row();
     }
     secondary_mtp_capture_allocations.clear();
+    for (PagedKVAllocation& allocation : tertiary_mtp_capture_allocations) {
+        allocation.unbind_row();
+    }
+    tertiary_mtp_capture_allocations.clear();
     for (PagedKVAllocation& allocation : text_capture_allocations) { allocation.unbind_row(); }
     text_capture_allocations.clear();
     for (PagedKVAllocation& allocation : secondary_text_capture_allocations) {
